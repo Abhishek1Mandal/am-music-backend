@@ -1,10 +1,42 @@
+# Environment
 .env
 .env.*
 !.env.example
 
+# Virtual environment
 .venv/
+venv/
+
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+
+# Testing
 .pytest_cache/
+.coverage
+htmlcov/
+
+# Type checking
 .mypy_cache/
+
+# Ruff
 .ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Music files
+music/
+downloads/
+
+# Alembic
+*.db
