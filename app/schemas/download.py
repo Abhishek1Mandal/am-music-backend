@@ -8,24 +8,27 @@ class DownloadCreate(BaseModel):
     """
     Request body for creating a download.
 
-    Flutter only needs to send the MusicBrainz recording MBID.
-    The backend resolves the source URL automatically.
+    Flutter only sends the MusicBrainz recording MBID.
     """
 
     musicbrainz_id: str = Field(
         ...,
         min_length=1,
         max_length=100,
-        description="MusicBrainz recording MBID.",
     )
 
 
 class DownloadResponse(BaseModel):
     """
-    Public representation of a download.
+    API response for a download.
+
+    is_downloaded is calculated by the backend from the
+    actual Track + physical file state.
     """
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True,
+    )
 
     id: UUID
     user_id: UUID

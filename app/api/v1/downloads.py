@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from datetime import datetime, timezone
@@ -8,7 +9,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal, get_db
@@ -41,7 +42,186 @@ router = APIRouter(
 
 
 # ============================================================
-# Helpers
+# Constants
+# ============================================================
+
+ACTIVE_DOWNLOAD_STATUSES = {
+    "pending",
+    "resolving",
+    "downloading",
+    "processing",
+}
+
+
+# ============================================================
+# General helpers
+# ============================================================
+
+
+def file_exists(
+    file_path: str | None,
+) -> bool:
+    """
+    Check whether the physical music file exists.
+    """
+
+    if not file_path:
+        return False
+
+    try:
+        return Path(file_path).is_file()
+    except OSError:
+        return False
+
+
+def delete_file_safely(
+    file_path: str | None,
+) -> None:
+    """
+    Delete a physical music file safely.
+
+    Cleanup failure should never hide the original operation.
+    """
+
+    if not file_path:
+        return
+
+    try:
+        path = Path(file_path)
+
+        if path.is_file():
+            path.unlink()
+
+            logger.info(
+                "[DOWNLOAD] Deleted file: %s",
+                path,
+            )
+
+    except OSError:
+        logger.exception(
+            "[DOWNLOAD] Failed to delete file: %s",
+            file_path,
+        )
+
+
+def parse_release_date(
+    value: str | None,
+):
+    """
+    Convert MusicBrainz release date into a Python date.
+
+    Supported formats:
+
+        YYYY
+        YYYY-MM
+        YYYY-MM-DD
+    """
+
+    if not value:
+        return None
+
+    value = value.strip()
+
+    try:
+        if len(value) >= 10:
+            return datetime.strptime(
+                value[:10],
+                "%Y-%m-%d",
+            ).date()
+
+        if len(value) >= 7:
+            return datetime.strptime(
+                value[:7],
+                "%Y-%m",
+            ).date().replace(
+                day=1,
+            )
+
+        if len(value) >= 4:
+            return datetime.strptime(
+                value[:4],
+                "%Y",
+            ).date().replace(
+                month=1,
+                day=1,
+            )
+
+    except ValueError:
+        logger.warning(
+            "[DOWNLOAD] Invalid release date: %s",
+            value,
+        )
+
+    return None
+
+
+# ============================================================
+# PostgreSQL advisory lock
+# ============================================================
+
+
+def build_download_lock_key(
+    user_id: UUID,
+    musicbrainz_id: str,
+) -> int:
+    """
+    Build a deterministic PostgreSQL advisory-lock key.
+
+    The same user + MusicBrainz recording always produces
+    the same lock key.
+
+    This protects against multiple simultaneous download
+    requests for the same user + track.
+    """
+
+    value = f"{user_id}:{musicbrainz_id}"
+
+    digest = hashlib.sha256(
+        value.encode("utf-8"),
+    ).digest()
+
+    # PostgreSQL bigint is signed 64-bit.
+    number = int.from_bytes(
+        digest[:8],
+        byteorder="big",
+        signed=False,
+    )
+
+    if number >= 2**63:
+        number -= 2**64
+
+    return number
+
+
+async def acquire_download_lock(
+    db: AsyncSession,
+    user_id: UUID,
+    musicbrainz_id: str,
+) -> None:
+    """
+    Acquire a transaction-scoped PostgreSQL advisory lock.
+
+    The lock is automatically released when the transaction
+    commits or rolls back.
+    """
+
+    lock_key = build_download_lock_key(
+        user_id,
+        musicbrainz_id,
+    )
+
+    await db.execute(
+        text(
+            "SELECT pg_advisory_xact_lock(:lock_key)"
+        ),
+        {
+            "lock_key": lock_key,
+        },
+    )
+
+
+# ============================================================
+# Download queries
 # ============================================================
 
 
@@ -92,22 +272,17 @@ async def get_active_download(
     musicbrainz_id: str,
 ) -> Download | None:
     """
-    Find an existing active download for the same user + track.
+    Find an active download for the same user + track.
     """
-
-    active_statuses = {
-        "pending",
-        "resolving",
-        "downloading",
-        "processing",
-    }
 
     result = await db.execute(
         select(Download)
         .where(
             Download.user_id == user_id,
             Download.musicbrainz_id == musicbrainz_id,
-            Download.status.in_(active_statuses),
+            Download.status.in_(
+                ACTIVE_DOWNLOAD_STATUSES,
+            ),
         )
         .order_by(
             Download.created_at.desc(),
@@ -117,96 +292,177 @@ async def get_active_download(
     return result.scalars().first()
 
 
-def file_exists(
-    file_path: str | None,
+async def get_latest_completed_download(
+    db: AsyncSession,
+    user_id: UUID,
+    musicbrainz_id: str,
+    track_id: UUID | None = None,
+) -> Download | None:
+    """
+    Get the latest completed download for a user + track.
+    """
+
+    query = (
+        select(Download)
+        .where(
+            Download.user_id == user_id,
+            Download.musicbrainz_id == musicbrainz_id,
+            Download.status == "completed",
+        )
+        .order_by(
+            Download.completed_at.desc(),
+        )
+    )
+
+    if track_id is not None:
+        query = query.where(
+            Download.track_id == track_id,
+        )
+
+    result = await db.execute(query)
+
+    return result.scalars().first()
+
+
+async def has_other_download_reference(
+    db: AsyncSession,
+    track_id: UUID,
+    excluding_download_id: UUID | None = None,
 ) -> bool:
-    if not file_path:
-        return False
-
-    try:
-        return Path(file_path).is_file()
-    except OSError:
-        return False
-
-
-def delete_file_safely(
-    file_path: str | None,
-) -> None:
     """
-    Delete a downloaded file without allowing cleanup failure
-    to hide the original download error.
+    Check whether another Download record references this Track.
     """
 
-    if not file_path:
-        return
+    query = select(Download.id).where(
+        Download.track_id == track_id,
+        Download.status == "completed",
+    )
 
-    try:
-        path = Path(file_path)
-
-        if path.is_file():
-            path.unlink()
-
-            logger.info(
-                "[DOWNLOAD] Deleted file: %s",
-                path,
-            )
-
-    except OSError:
-        logger.exception(
-            "[DOWNLOAD] Failed to delete file: %s",
-            file_path,
+    if excluding_download_id is not None:
+        query = query.where(
+            Download.id != excluding_download_id,
         )
 
+    result = await db.execute(
+        query.limit(1),
+    )
 
-def parse_release_date(
-    value: str | None,
-):
+    return result.scalar_one_or_none() is not None
+
+
+async def has_other_library_reference(
+    db: AsyncSession,
+    track_id: UUID,
+    excluding_user_id: UUID | None = None,
+) -> bool:
     """
-    Convert MusicBrainz release date into a Python date.
-
-    MusicBrainz can return:
-
-        YYYY
-        YYYY-MM
-        YYYY-MM-DD
+    Check whether another LibraryItem references this Track.
     """
 
-    if not value:
-        return None
+    query = select(LibraryItem.id).where(
+        LibraryItem.track_id == track_id,
+    )
 
-    value = value.strip()
-
-    try:
-        if len(value) >= 10:
-            return datetime.strptime(
-                value[:10],
-                "%Y-%m-%d",
-            ).date()
-
-        if len(value) >= 7:
-            return datetime.strptime(
-                value[:7],
-                "%Y-%m",
-            ).date().replace(
-                day=1,
-            )
-
-        if len(value) >= 4:
-            return datetime.strptime(
-                value[:4],
-                "%Y",
-            ).date().replace(
-                month=1,
-                day=1,
-            )
-
-    except ValueError:
-        logger.warning(
-            "[DOWNLOAD] Invalid release date: %s",
-            value,
+    if excluding_user_id is not None:
+        query = query.where(
+            LibraryItem.user_id != excluding_user_id,
         )
 
-    return None
+    result = await db.execute(
+        query.limit(1),
+    )
+
+    return result.scalar_one_or_none() is not None
+
+
+# ============================================================
+# Track availability
+# ============================================================
+
+
+async def sync_track_availability(
+    db: AsyncSession,
+    track: Track,
+) -> bool:
+    """
+    Synchronize Track.is_available with the physical file.
+
+    If the user manually deletes or moves the file, the old
+    file path becomes unavailable.
+
+    We do NOT attempt to automatically find the moved file.
+    """
+
+    available = file_exists(
+        track.file_path,
+    )
+
+    if track.is_available != available:
+        logger.info(
+            "[DOWNLOAD] Track availability changed: "
+            "track=%s available=%s path=%s",
+            track.id,
+            available,
+            track.file_path,
+        )
+
+        track.is_available = available
+
+        await db.flush()
+
+    return available
+
+
+async def build_download_response(
+    db: AsyncSession,
+    download: Download,
+) -> DownloadResponse:
+    """
+    Build the API response with a dynamically calculated
+    is_downloaded value.
+    """
+
+    is_downloaded = False
+
+    track: Track | None = None
+
+    if download.track_id:
+        result = await db.execute(
+            select(Track).where(
+                Track.id == download.track_id,
+            )
+        )
+
+        track = result.scalar_one_or_none()
+
+    if track is not None:
+        is_downloaded = await sync_track_availability(
+            db,
+            track,
+        )
+
+    # A completed Download without a Track should never
+    # be reported as downloaded.
+    if download.status != "completed":
+        is_downloaded = False
+
+    # Keep Download.file_path synchronized with Track.file_path.
+    if track is not None:
+        download.file_path = track.file_path
+
+    return DownloadResponse(
+        id=download.id,
+        user_id=download.user_id,
+        track_id=download.track_id,
+        musicbrainz_id=download.musicbrainz_id,
+        source_url=download.source_url,
+        status=download.status,
+        file_path=download.file_path,
+        error_message=download.error_message,
+        created_at=download.created_at,
+        completed_at=download.completed_at,
+        is_downloaded=is_downloaded,
+    )
 
 
 # ============================================================
@@ -224,14 +480,10 @@ async def find_or_create_artist(
     """
     Find an Artist by MusicBrainz MBID first.
 
-    Falls back to name when no MBID is available.
+    Falls back to artist name.
     """
 
     artist: Artist | None = None
-
-    # --------------------------------------------------------
-    # Find by MusicBrainz ID
-    # --------------------------------------------------------
 
     if musicbrainz_id:
         result = await db.execute(
@@ -242,10 +494,6 @@ async def find_or_create_artist(
 
         artist = result.scalar_one_or_none()
 
-    # --------------------------------------------------------
-    # Fallback: find by name
-    # --------------------------------------------------------
-
     if artist is None:
         result = await db.execute(
             select(Artist).where(
@@ -254,10 +502,6 @@ async def find_or_create_artist(
         )
 
         artist = result.scalars().first()
-
-    # --------------------------------------------------------
-    # Create artist
-    # --------------------------------------------------------
 
     if artist is None:
         artist = Artist(
@@ -274,10 +518,6 @@ async def find_or_create_artist(
             "[DOWNLOAD] Created artist: %s",
             name,
         )
-
-    # --------------------------------------------------------
-    # Update missing metadata
-    # --------------------------------------------------------
 
     else:
         if musicbrainz_id and not artist.musicbrainz_id:
@@ -306,10 +546,7 @@ async def find_or_create_album(
     release_date: str | None,
 ) -> Album | None:
     """
-    Find or create the album/release.
-
-    Prefer release MBID because Album represents the concrete
-    MusicBrainz release rather than the release group.
+    Find or create the concrete MusicBrainz release.
     """
 
     if not title:
@@ -317,11 +554,10 @@ async def find_or_create_album(
 
     album: Album | None = None
 
-    # --------------------------------------------------------
-    # Prefer concrete release MBID
-    # --------------------------------------------------------
-
-    lookup_mbid = release_mbid or release_group_mbid
+    lookup_mbid = (
+        release_mbid
+        or release_group_mbid
+    )
 
     if lookup_mbid:
         result = await db.execute(
@@ -332,10 +568,6 @@ async def find_or_create_album(
 
         album = result.scalar_one_or_none()
 
-    # --------------------------------------------------------
-    # Fallback: artist + album title
-    # --------------------------------------------------------
-
     if album is None:
         result = await db.execute(
             select(Album).where(
@@ -345,10 +577,6 @@ async def find_or_create_album(
         )
 
         album = result.scalars().first()
-
-    # --------------------------------------------------------
-    # Create album
-    # --------------------------------------------------------
 
     if album is None:
         album = Album(
@@ -369,17 +597,16 @@ async def find_or_create_album(
             title,
         )
 
-    # --------------------------------------------------------
-    # Update missing metadata
-    # --------------------------------------------------------
-
     else:
         if release_date and not album.release_date:
             album.release_date = parse_release_date(
                 release_date,
             )
 
-        if lookup_mbid and not album.musicbrainz_id:
+        if (
+            lookup_mbid
+            and not album.musicbrainz_id
+        ):
             album.musicbrainz_id = lookup_mbid
 
         await db.flush()
@@ -403,8 +630,8 @@ async def find_or_create_track(
     file_path: str,
 ) -> Track:
     """
-    Find an existing Track by MusicBrainz recording MBID
-    or create a new Track.
+    Find a Track by MusicBrainz recording MBID
+    or create it.
     """
 
     result = await db.execute(
@@ -418,13 +645,11 @@ async def find_or_create_track(
     file_size: int | None = None
 
     try:
-        file_size = os.path.getsize(file_path)
+        file_size = os.path.getsize(
+            file_path,
+        )
     except OSError:
         pass
-
-    # --------------------------------------------------------
-    # Create track
-    # --------------------------------------------------------
 
     if track is None:
         track = Track(
@@ -447,10 +672,6 @@ async def find_or_create_track(
             "[DOWNLOAD] Created track: %s",
             title,
         )
-
-    # --------------------------------------------------------
-    # Update existing track
-    # --------------------------------------------------------
 
     else:
         track.artist_id = artist_id
@@ -487,7 +708,7 @@ async def add_to_library(
     track_id: UUID,
 ) -> LibraryItem:
     """
-    Add track to user's library if it isn't already there.
+    Add Track to user's library if it isn't already there.
     """
 
     existing = await get_user_library_item(
@@ -518,7 +739,7 @@ async def add_to_library(
 
 
 # ============================================================
-# Download status
+# Failed download
 # ============================================================
 
 
@@ -527,10 +748,7 @@ async def mark_download_failed(
     error_message: str,
 ) -> None:
     """
-    Update the Download record after a background failure.
-
-    Uses a fresh database session because the original session
-    may already have been rolled back.
+    Mark a background download as failed.
     """
 
     async with AsyncSessionLocal() as db:
@@ -576,20 +794,29 @@ async def process_download(
     musicbrainz_id: str,
 ) -> None:
     """
-    Complete the entire download pipeline in the background.
+    Complete the entire download pipeline.
 
-    Flutter only provides the MusicBrainz recording MBID.
+    Flutter provides ONLY the MusicBrainz recording MBID.
 
-    The backend:
+    Backend:
 
-        1. Fetches MusicBrainz metadata.
-        2. Resolves a YouTube source automatically.
-        3. Downloads the source using yt-dlp.
-        4. Creates/updates Artist.
-        5. Creates/updates Album.
-        6. Creates/updates Track.
-        7. Adds Track to user's library.
-        8. Marks Download as completed.
+        MusicBrainz
+            ↓
+        Metadata
+            ↓
+        YouTube resolver
+            ↓
+        yt-dlp
+            ↓
+        Artist
+            ↓
+        Album
+            ↓
+        Track
+            ↓
+        Library
+            ↓
+        Completed Download
     """
 
     logger.info(
@@ -603,7 +830,7 @@ async def process_download(
         try:
 
             # ==================================================
-            # Load download
+            # Load Download
             # ==================================================
 
             download = await get_download_by_id(
@@ -619,7 +846,7 @@ async def process_download(
                 return
 
             # ==================================================
-            # Check if track is already downloaded
+            # Check existing Track
             # ==================================================
 
             existing_track = await get_existing_track(
@@ -627,38 +854,40 @@ async def process_download(
                 musicbrainz_id,
             )
 
-            if (
-                existing_track
-                and existing_track.is_available
-                and file_exists(existing_track.file_path)
-            ):
-                logger.info(
-                    "[DOWNLOAD] Track already downloaded: %s",
-                    musicbrainz_id,
-                )
-
-                await add_to_library(
+            if existing_track:
+                available = await sync_track_availability(
                     db,
-                    user_id=user_id,
-                    track_id=existing_track.id,
+                    existing_track,
                 )
 
-                download.track_id = existing_track.id
-                download.file_path = existing_track.file_path
-                download.status = "completed"
-                download.error_message = None
-                download.completed_at = datetime.now(
-                    timezone.utc,
-                )
+                if available:
+                    logger.info(
+                        "[DOWNLOAD] Track already downloaded: %s",
+                        musicbrainz_id,
+                    )
 
-                await db.commit()
+                    await add_to_library(
+                        db,
+                        user_id=user_id,
+                        track_id=existing_track.id,
+                    )
 
-                logger.info(
-                    "[DOWNLOAD] Reused existing track: %s",
-                    existing_track.id,
-                )
+                    download.track_id = existing_track.id
+                    download.file_path = existing_track.file_path
+                    download.status = "completed"
+                    download.error_message = None
+                    download.completed_at = datetime.now(
+                        timezone.utc,
+                    )
 
-                return
+                    await db.commit()
+
+                    logger.info(
+                        "[DOWNLOAD] Reused existing track: %s",
+                        existing_track.id,
+                    )
+
+                    return
 
             # ==================================================
             # Fetch MusicBrainz recording
@@ -700,7 +929,7 @@ async def process_download(
                 )
 
             # ==================================================
-            # Resolve YouTube source automatically
+            # Resolve YouTube source
             # ==================================================
 
             logger.info(
@@ -709,9 +938,15 @@ async def process_download(
 
             resolved_source = await resolve_source(
                 title=metadata["title"],
-                artist=metadata.get("artist_name"),
-                album=metadata.get("album_name"),
-                duration_ms=metadata.get("duration_ms"),
+                artist=metadata.get(
+                    "artist_name",
+                ),
+                album=metadata.get(
+                    "album_name",
+                ),
+                duration_ms=metadata.get(
+                    "duration_ms",
+                ),
             )
 
             logger.info(
@@ -722,11 +957,10 @@ async def process_download(
                 resolved_source.score,
             )
 
-            # ==================================================
-            # Save resolved source
-            # ==================================================
+            download.source_url = (
+                resolved_source.url
+            )
 
-            download.source_url = resolved_source.url
             download.status = "downloading"
 
             await db.commit()
@@ -739,15 +973,6 @@ async def process_download(
                 "[DOWNLOAD] Starting audio download..."
             )
 
-            # IMPORTANT:
-            #
-            # download_audio() is synchronous because yt-dlp
-            # performs blocking I/O.
-            #
-            # Run it in a worker thread so we don't block
-            # FastAPI's async event loop.
-            #
-
             download_result = await asyncio.to_thread(
                 download_audio,
                 resolved_source.url,
@@ -755,16 +980,8 @@ async def process_download(
 
             if not download_result:
                 raise RuntimeError(
-                    "Downloader did not return a result."
+                    "Downloader did not return a result.",
                 )
-
-            # download_audio() returns:
-            #
-            # {
-            #     "file_path": "...",
-            #     "metadata": {...},
-            # }
-            #
 
             file_path = download_result.get(
                 "file_path",
@@ -772,12 +989,12 @@ async def process_download(
 
             if not file_path:
                 raise RuntimeError(
-                    "Downloader did not return a file path."
+                    "Downloader did not return a file path.",
                 )
 
             if not file_exists(file_path):
                 raise RuntimeError(
-                    f"Downloaded file does not exist: {file_path}"
+                    f"Downloaded file does not exist: {file_path}",
                 )
 
             logger.info(
@@ -795,7 +1012,7 @@ async def process_download(
             await db.commit()
 
             # ==================================================
-            # Create/update Artist
+            # Artist
             # ==================================================
 
             artist = await find_or_create_artist(
@@ -810,7 +1027,7 @@ async def process_download(
             )
 
             # ==================================================
-            # Create/update Album
+            # Album
             # ==================================================
 
             album = await find_or_create_album(
@@ -831,7 +1048,7 @@ async def process_download(
             )
 
             # ==================================================
-            # Create/update Track
+            # Track
             # ==================================================
 
             track = await find_or_create_track(
@@ -839,7 +1056,11 @@ async def process_download(
                 musicbrainz_id=musicbrainz_id,
                 title=metadata["title"],
                 artist_id=artist.id,
-                album_id=album.id if album else None,
+                album_id=(
+                    album.id
+                    if album
+                    else None
+                ),
                 duration_ms=metadata.get(
                     "duration_ms",
                 ),
@@ -847,7 +1068,7 @@ async def process_download(
             )
 
             # ==================================================
-            # Add to user's library
+            # Library
             # ==================================================
 
             await add_to_library(
@@ -857,7 +1078,7 @@ async def process_download(
             )
 
             # ==================================================
-            # Complete Download
+            # Complete
             # ==================================================
 
             download.track_id = track.id
@@ -879,7 +1100,7 @@ async def process_download(
             )
 
         # ======================================================
-        # Source resolver error
+        # Source resolution failure
         # ======================================================
 
         except SourceResolverError as exc:
@@ -896,7 +1117,7 @@ async def process_download(
             )
 
         # ======================================================
-        # MusicBrainz error
+        # MusicBrainz failure
         # ======================================================
 
         except MusicBrainzRecordingError as exc:
@@ -913,7 +1134,7 @@ async def process_download(
             )
 
         # ======================================================
-        # General error
+        # General failure
         # ======================================================
 
         except Exception as exc:
@@ -931,7 +1152,7 @@ async def process_download(
 
 
 # ============================================================
-# API
+# CREATE DOWNLOAD
 # ============================================================
 
 
@@ -952,28 +1173,30 @@ async def create_download(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> DownloadResponse:
-    """
-    Create a background music download.
-
-    Client sends only:
-
-        {
-            "musicbrainz_id": "..."
-        }
-
-    The backend handles source resolution and downloading.
-    """
 
     musicbrainz_id = payload.musicbrainz_id.strip()
 
     if not musicbrainz_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="MusicBrainz recording MBID cannot be empty.",
+            detail=(
+                "MusicBrainz recording MBID "
+                "cannot be empty."
+            ),
         )
 
     # ========================================================
-    # Already downloaded?
+    # Protect against simultaneous clicks
+    # ========================================================
+
+    await acquire_download_lock(
+        db,
+        current_user.id,
+        musicbrainz_id,
+    )
+
+    # ========================================================
+    # Existing Track
     # ========================================================
 
     existing_track = await get_existing_track(
@@ -981,62 +1204,71 @@ async def create_download(
         musicbrainz_id,
     )
 
-    if (
-        existing_track
-        and existing_track.is_available
-        and file_exists(existing_track.file_path)
-    ):
-        await add_to_library(
+    if existing_track:
+
+        # Check actual physical file.
+        available = await sync_track_availability(
             db,
-            user_id=current_user.id,
-            track_id=existing_track.id,
+            existing_track,
         )
 
-        # Return existing completed download if available.
-        result = await db.execute(
-            select(Download)
-            .where(
-                Download.user_id == current_user.id,
-                Download.musicbrainz_id == musicbrainz_id,
-                Download.status == "completed",
-                Download.track_id == existing_track.id,
+        if available:
+
+            # Add to user's library if necessary.
+            await add_to_library(
+                db,
+                user_id=current_user.id,
+                track_id=existing_track.id,
             )
-            .order_by(
-                Download.completed_at.desc(),
+
+            # Find existing completed download.
+            existing_download = (
+                await get_latest_completed_download(
+                    db,
+                    current_user.id,
+                    musicbrainz_id,
+                    existing_track.id,
+                )
             )
-        )
 
-        existing_download = result.scalars().first()
+            if existing_download:
 
-        if existing_download:
-            return existing_download
+                await db.commit()
 
-        # No previous Download record exists.
-        # Create a completed record pointing to
-        # the already-existing Track.
+                return await build_download_response(
+                    db,
+                    existing_download,
+                )
 
-        completed_download = Download(
-            user_id=current_user.id,
-            track_id=existing_track.id,
-            musicbrainz_id=musicbrainz_id,
-            source_url=None,
-            status="completed",
-            file_path=existing_track.file_path,
-            error_message=None,
-            completed_at=datetime.now(
-                timezone.utc,
-            ),
-        )
+            # No Download history exists for this user,
+            # but the Track itself already exists.
+            completed_download = Download(
+                user_id=current_user.id,
+                track_id=existing_track.id,
+                musicbrainz_id=musicbrainz_id,
+                source_url=None,
+                status="completed",
+                file_path=existing_track.file_path,
+                error_message=None,
+                completed_at=datetime.now(
+                    timezone.utc,
+                ),
+            )
 
-        db.add(completed_download)
+            db.add(completed_download)
 
-        await db.commit()
-        await db.refresh(completed_download)
+            await db.commit()
+            await db.refresh(
+                completed_download,
+            )
 
-        return completed_download
+            return await build_download_response(
+                db,
+                completed_download,
+            )
 
     # ========================================================
-    # Existing active download?
+    # Existing active download
     # ========================================================
 
     active_download = await get_active_download(
@@ -1046,15 +1278,21 @@ async def create_download(
     )
 
     if active_download:
+
         logger.info(
             "[DOWNLOAD] Reusing active download: %s",
             active_download.id,
         )
 
-        return active_download
+        await db.commit()
+
+        return await build_download_response(
+            db,
+            active_download,
+        )
 
     # ========================================================
-    # Create pending download
+    # Create new Download
     # ========================================================
 
     download = Download(
@@ -1071,7 +1309,10 @@ async def create_download(
     db.add(download)
 
     await db.commit()
-    await db.refresh(download)
+
+    await db.refresh(
+        download,
+    )
 
     logger.info(
         "[DOWNLOAD] Queued: id=%s mbid=%s user=%s",
@@ -1081,7 +1322,7 @@ async def create_download(
     )
 
     # ========================================================
-    # Start background processing
+    # Start background worker
     # ========================================================
 
     background_tasks.add_task(
@@ -1091,11 +1332,14 @@ async def create_download(
         musicbrainz_id,
     )
 
-    return download
+    return await build_download_response(
+        db,
+        download,
+    )
 
 
 # ============================================================
-# Get downloads
+# GET DOWNLOADS
 # ============================================================
 
 
@@ -1107,9 +1351,11 @@ async def create_download(
 async def get_downloads(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> list[Download]:
+) -> list[DownloadResponse]:
     """
     Return downloads belonging to the authenticated user.
+
+    is_downloaded is calculated from the actual physical file.
     """
 
     result = await db.execute(
@@ -1122,11 +1368,31 @@ async def get_downloads(
         )
     )
 
-    return list(result.scalars().all())
+    downloads = list(
+        result.scalars().all()
+    )
+
+    responses: list[DownloadResponse] = []
+
+    for download in downloads:
+
+        response = await build_download_response(
+            db,
+            download,
+        )
+
+        responses.append(
+            response,
+        )
+
+    # Persist availability changes caused by missing files.
+    await db.commit()
+
+    return responses
 
 
 # ============================================================
-# Get single download
+# GET SINGLE DOWNLOAD
 # ============================================================
 
 
@@ -1139,7 +1405,7 @@ async def get_download(
     download_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> Download:
+) -> DownloadResponse:
     """
     Return a single download belonging to the authenticated user.
     """
@@ -1159,11 +1425,18 @@ async def get_download(
             detail="Download not found.",
         )
 
-    return download
+    response = await build_download_response(
+        db,
+        download,
+    )
+
+    await db.commit()
+
+    return response
 
 
 # ============================================================
-# Delete download
+# DELETE DOWNLOAD
 # ============================================================
 
 
@@ -1178,13 +1451,11 @@ async def delete_download(
     current_user: User = Depends(get_current_user),
 ) -> None:
     """
-    Remove a download and its associated library item.
+    Delete a user's download.
 
-    The physical file is removed only when it is no longer
-    referenced by another library item.
-
-    This assumes the current music library storage model
-    uses one physical file per Track.
+    The physical file is deleted only when:
+        - no other completed Download references it
+        - no other LibraryItem references the Track
     """
 
     result = await db.execute(
@@ -1206,10 +1477,11 @@ async def delete_download(
     file_path = download.file_path
 
     # ========================================================
-    # Remove user's library entry
+    # Remove current user's library reference
     # ========================================================
 
     if track_id:
+
         library_result = await db.execute(
             select(LibraryItem).where(
                 LibraryItem.user_id == current_user.id,
@@ -1217,37 +1489,72 @@ async def delete_download(
             )
         )
 
-        library_item = library_result.scalar_one_or_none()
+        library_item = (
+            library_result.scalar_one_or_none()
+        )
 
         if library_item:
-            await db.delete(library_item)
 
-            await db.flush()
+            # Only remove the library entry if the user
+            # doesn't have another completed download for
+            # the same Track.
+
+            other_user_download_result = await db.execute(
+                select(Download.id)
+                .where(
+                    Download.user_id == current_user.id,
+                    Download.track_id == track_id,
+                    Download.status == "completed",
+                    Download.id != download_id,
+                )
+                .limit(1)
+            )
+
+            other_user_download = (
+                other_user_download_result.scalar_one_or_none()
+            )
+
+            if other_user_download is None:
+                await db.delete(
+                    library_item,
+                )
+
+                await db.flush()
 
     # ========================================================
-    # Check whether another user/library item
-    # references the track
+    # Check other references
     # ========================================================
 
-    should_delete_file = True
+    other_download_reference = False
 
     if track_id:
-        reference_result = await db.execute(
-            select(LibraryItem).where(
-                LibraryItem.track_id == track_id,
+        other_download_reference = (
+            await has_other_download_reference(
+                db,
+                track_id,
+                excluding_download_id=download_id,
             )
         )
 
-        another_library_item = (
-            reference_result.scalars().first()
+    other_library_reference = False
+
+    if track_id:
+        other_library_reference = (
+            await has_other_library_reference(
+                db,
+                track_id,
+                excluding_user_id=current_user.id,
+            )
         )
 
-        if another_library_item:
-            should_delete_file = False
+    # ========================================================
+    # Delete physical file only when safe
+    # ========================================================
 
-    # ========================================================
-    # Delete physical file
-    # ========================================================
+    should_delete_file = (
+        not other_download_reference
+        and not other_library_reference
+    )
 
     if should_delete_file:
         delete_file_safely(
@@ -1255,10 +1562,11 @@ async def delete_download(
         )
 
     # ========================================================
-    # Mark Track unavailable when no library references it
+    # Update Track
     # ========================================================
 
     if track_id:
+
         track_result = await db.execute(
             select(Track).where(
                 Track.id == track_id,
@@ -1268,6 +1576,7 @@ async def delete_download(
         track = track_result.scalar_one_or_none()
 
         if track:
+
             remaining_library_result = await db.execute(
                 select(LibraryItem).where(
                     LibraryItem.track_id == track.id,
@@ -1278,7 +1587,24 @@ async def delete_download(
                 remaining_library_result.scalars().first()
             )
 
-            if remaining_library_item is None:
+            remaining_download_result = await db.execute(
+                select(Download.id)
+                .where(
+                    Download.track_id == track.id,
+                    Download.id != download_id,
+                    Download.status == "completed",
+                )
+                .limit(1)
+            )
+
+            remaining_download = (
+                remaining_download_result.scalar_one_or_none()
+            )
+
+            if (
+                remaining_library_item is None
+                and remaining_download is None
+            ):
                 track.is_available = False
 
                 if should_delete_file:
@@ -1286,10 +1612,12 @@ async def delete_download(
                     track.file_size = None
 
     # ========================================================
-    # Delete download
+    # Delete Download record
     # ========================================================
 
-    await db.delete(download)
+    await db.delete(
+        download,
+    )
 
     await db.commit()
 

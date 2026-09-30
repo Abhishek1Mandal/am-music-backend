@@ -28,12 +28,15 @@ class MusicBrainzService:
             pool=5.0,
         )
 
+    # ==========================================
+    # HTTP GET
+    # ==========================================
+
     async def _get(
         self,
         endpoint: str,
         params: dict[str, Any],
     ) -> dict[str, Any]:
-
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
 
         async with httpx.AsyncClient(
@@ -41,7 +44,6 @@ class MusicBrainzService:
             timeout=self.timeout,
             follow_redirects=True,
         ) as client:
-
             response = await client.get(
                 url,
                 params=params,
@@ -61,7 +63,6 @@ class MusicBrainzService:
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[list[MusicArtistResult], int]:
-
         data = await self._get(
             "/artist",
             {
@@ -75,9 +76,11 @@ class MusicBrainzService:
         artists: list[MusicArtistResult] = []
 
         for item in data.get("artists", []):
+            artist_mbid = item.get("id")
+
             artists.append(
                 MusicArtistResult(
-                    mbid=item.get("id", ""),
+                    mbid=artist_mbid or "",
                     name=item.get("name", ""),
                     sort_name=item.get("sort-name"),
                     country=item.get("country"),
@@ -98,7 +101,6 @@ class MusicBrainzService:
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[list[MusicAlbumResult], int]:
-
         data = await self._get(
             "/release",
             {
@@ -112,6 +114,7 @@ class MusicBrainzService:
         albums: list[MusicAlbumResult] = []
 
         for item in data.get("releases", []):
+            release_mbid = item.get("id")
 
             artist_name = None
             artist_mbid = None
@@ -121,7 +124,7 @@ class MusicBrainzService:
             if artist_credit:
                 first_artist = artist_credit[0]
 
-                artist = first_artist.get("artist", {})
+                artist = first_artist.get("artist") or {}
 
                 artist_name = artist.get("name")
                 artist_mbid = artist.get("id")
@@ -136,17 +139,18 @@ class MusicBrainzService:
 
             cover_art_url = None
 
-            if item.get("id"):
+            if release_mbid:
                 cover_art_url = (
                     cover_art_service.get_front_cover_url(
-                        item["id"],
+                        release_mbid,
                         500,
                     )
                 )
 
             albums.append(
                 MusicAlbumResult(
-                    mbid=item.get("id", ""),
+                    # This is the MusicBrainz RELEASE MBID.
+                    mbid=release_mbid or "",
                     title=item.get("title", ""),
                     artist_name=artist_name,
                     artist_mbid=artist_mbid,
@@ -171,7 +175,6 @@ class MusicBrainzService:
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[list[MusicTrackResult], int]:
-
         data = await self._get(
             "/recording",
             {
@@ -179,12 +182,33 @@ class MusicBrainzService:
                 "fmt": "json",
                 "limit": limit,
                 "offset": offset,
+                "inc": "artists+releases",
             },
         )
 
         tracks: list[MusicTrackResult] = []
 
         for item in data.get("recordings", []):
+            # ==========================================
+            # IMPORTANT:
+            #
+            # item["id"] is the RECORDING MBID.
+            #
+            # This is the ID that must be sent to:
+            #
+            # POST /api/v1/downloads
+            #
+            # Do NOT replace this with release.id.
+            # ==========================================
+
+            recording_mbid = item.get("id")
+
+            if not recording_mbid:
+                continue
+
+            # ==========================================
+            # Artist
+            # ==========================================
 
             artist_name = None
             artist_mbid = None
@@ -194,10 +218,14 @@ class MusicBrainzService:
             if artist_credit:
                 first_artist = artist_credit[0]
 
-                artist = first_artist.get("artist", {})
+                artist = first_artist.get("artist") or {}
 
                 artist_name = artist.get("name")
                 artist_mbid = artist.get("id")
+
+            # ==========================================
+            # Release / Album
+            # ==========================================
 
             release_mbid = None
             album_name = None
@@ -209,7 +237,11 @@ class MusicBrainzService:
             releases = item.get("releases") or []
 
             if releases:
-
+                # MusicBrainz can return multiple releases.
+                #
+                # For now we use the first release returned by
+                # MusicBrainz, while keeping the recording MBID
+                # completely separate.
                 release = releases[0]
 
                 release_mbid = release.get("id")
@@ -221,8 +253,18 @@ class MusicBrainzService:
                     or {}
                 )
 
-                album_mbid = release_mbid
                 release_group_mbid = release_group.get("id")
+
+                # ==========================================
+                # IMPORTANT:
+                #
+                # album_mbid represents the actual RELEASE
+                # associated with this result.
+                #
+                # release_mbid == release.id
+                # ==========================================
+
+                album_mbid = release_mbid
 
                 if release_mbid:
                     cover_art_url = (
@@ -232,21 +274,49 @@ class MusicBrainzService:
                         )
                     )
 
+            # ==========================================
+            # Track Result
+            # ==========================================
+
             tracks.append(
                 MusicTrackResult(
-                    mbid=item.get("id", ""),
+                    # ======================================
+                    # CRITICAL:
+                    #
+                    # This MUST be recording.id
+                    #
+                    # Example:
+                    # 7e246a92-68d7-4a9f-8fb0-a99e84012cb3
+                    #
+                    # This is what the download API expects.
+                    # ======================================
+                    mbid=recording_mbid,
+
                     title=item.get("title", ""),
+
                     artist_name=artist_name,
                     artist_mbid=artist_mbid,
+
                     album_name=album_name,
+
+                    # Release MBID
                     album_mbid=album_mbid,
+
+                    # Same release MBID, explicitly named
                     release_mbid=release_mbid,
+
+                    # Release-group MBID
                     release_group_mbid=release_group_mbid,
+
                     release_date=release_date,
+
+                    # MusicBrainz recording length is milliseconds.
                     duration_ms=item.get("length"),
+
                     disambiguation=item.get(
                         "disambiguation"
                     ),
+
                     cover_art_url=cover_art_url,
                 )
             )
@@ -263,7 +333,6 @@ class MusicBrainzService:
         limit: int = 20,
         offset: int = 0,
     ) -> MusicSearchResponse:
-
         artists, artist_count = await self.search_artists(
             query=query,
             limit=limit,

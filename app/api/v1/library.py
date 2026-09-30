@@ -1,5 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import delete, select
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -8,50 +10,48 @@ from app.models.library import LibraryItem
 from app.models.track import Track
 from app.models.user import User
 
+
 router = APIRouter(
     prefix="/library",
     tags=["Library"],
 )
 
 
+# ============================================================
+# GET USER LIBRARY
+# ============================================================
+
 @router.get("")
 async def get_library(
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=100,
+    ),
+    offset: int = Query(
+        default=0,
+        ge=0,
+    ),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Get tracks saved in the authenticated user's library.
-    """
-
-    if limit < 1 or limit > 100:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Limit must be between 1 and 100.",
-        )
-
-    if offset < 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Offset cannot be negative.",
-        )
-
-    result = await db.execute(
+    query = (
         select(LibraryItem, Track)
         .join(
             Track,
-            Track.id == LibraryItem.track_id,
+            LibraryItem.track_id == Track.id,
         )
         .where(
             LibraryItem.user_id == current_user.id,
         )
         .order_by(
-            LibraryItem.created_at.desc(),
+            LibraryItem.id.desc(),
         )
         .offset(offset)
         .limit(limit)
     )
+
+    result = await db.execute(query)
 
     rows = result.all()
 
@@ -65,30 +65,35 @@ async def get_library(
                 "title": track.title,
                 "artist_id": track.artist_id,
                 "album_id": track.album_id,
-                "created_at": library_item.created_at,
+                "duration_ms": track.duration_ms,
+                "musicbrainz_id": track.musicbrainz_id,
+                "is_available": track.is_available,
             }
         )
 
     return {
         "items": items,
-        "count": len(items),
         "limit": limit,
         "offset": offset,
     }
 
+
+# ============================================================
+# ADD TRACK TO LIBRARY
+# ============================================================
 
 @router.post(
     "/{track_id}",
     status_code=status.HTTP_201_CREATED,
 )
 async def add_to_library(
-    track_id: int,
+    track_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Add a track to the authenticated user's library.
-    """
+    # --------------------------------------------------------
+    # Check track
+    # --------------------------------------------------------
 
     track_result = await db.execute(
         select(Track).where(
@@ -101,8 +106,12 @@ async def add_to_library(
     if track is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Track not found.",
+            detail="Track not found",
         )
+
+    # --------------------------------------------------------
+    # Check duplicate
+    # --------------------------------------------------------
 
     existing_result = await db.execute(
         select(LibraryItem).where(
@@ -111,14 +120,18 @@ async def add_to_library(
         )
     )
 
-    existing = existing_result.scalar_one_or_none()
+    existing_item = existing_result.scalar_one_or_none()
 
-    if existing is not None:
+    if existing_item is not None:
         return {
-            "message": "Track is already in the library.",
-            "library_id": existing.id,
-            "track_id": track_id,
+            "id": existing_item.id,
+            "track_id": existing_item.track_id,
+            "message": "Track already exists in library",
         }
+
+    # --------------------------------------------------------
+    # Create library item
+    # --------------------------------------------------------
 
     library_item = LibraryItem(
         user_id=current_user.id,
@@ -128,26 +141,28 @@ async def add_to_library(
     db.add(library_item)
 
     await db.commit()
+
     await db.refresh(library_item)
 
     return {
-        "message": "Track added to library.",
-        "library_id": library_item.id,
+        "id": library_item.id,
         "track_id": library_item.track_id,
-        "created_at": library_item.created_at,
+        "message": "Track added to library",
     }
 
 
-@router.get("/{track_id}/status")
-async def library_status(
-    track_id: int,
+# ============================================================
+# GET LIBRARY STATUS
+# ============================================================
+
+@router.get(
+    "/{track_id}/status",
+)
+async def get_library_status(
+    track_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Check whether a track exists in the user's library.
-    """
-
     result = await db.execute(
         select(LibraryItem).where(
             LibraryItem.user_id == current_user.id,
@@ -157,27 +172,32 @@ async def library_status(
 
     library_item = result.scalar_one_or_none()
 
+    if library_item is None:
+        return {
+            "track_id": track_id,
+            "in_library": False,
+            "library_id": None,
+        }
+
     return {
         "track_id": track_id,
-        "in_library": library_item is not None,
-        "library_id": (
-            library_item.id
-            if library_item
-            else None
-        ),
+        "in_library": True,
+        "library_id": library_item.id,
     }
 
 
-@router.delete("/{track_id}")
+# ============================================================
+# REMOVE TRACK FROM LIBRARY
+# ============================================================
+
+@router.delete(
+    "/{track_id}",
+)
 async def remove_from_library(
-    track_id: int,
+    track_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Remove a track from the authenticated user's library.
-    """
-
     result = await db.execute(
         select(LibraryItem).where(
             LibraryItem.user_id == current_user.id,
@@ -190,7 +210,7 @@ async def remove_from_library(
     if library_item is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Track is not in the library.",
+            detail="Track is not in your library",
         )
 
     await db.delete(library_item)
@@ -198,29 +218,36 @@ async def remove_from_library(
     await db.commit()
 
     return {
-        "message": "Track removed from library.",
         "track_id": track_id,
+        "message": "Track removed from library",
     }
 
+
+# ============================================================
+# CLEAR USER LIBRARY
+# ============================================================
 
 @router.delete("")
 async def clear_library(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Remove all tracks from the authenticated user's library.
-    """
-
     result = await db.execute(
-        delete(LibraryItem).where(
+        select(LibraryItem).where(
             LibraryItem.user_id == current_user.id,
         )
     )
 
+    library_items = result.scalars().all()
+
+    deleted_count = len(library_items)
+
+    for library_item in library_items:
+        await db.delete(library_item)
+
     await db.commit()
 
     return {
-        "message": "Library cleared.",
-        "deleted_count": result.rowcount,
+        "message": "Library cleared",
+        "deleted_count": deleted_count,
     }

@@ -1,24 +1,38 @@
 from app.schemas.album import AlbumResponse
 from app.schemas.artist import ArtistResponse
-from app.schemas.playlist import PlaylistCreate, PlaylistResponse
-from app.schemas.track import TrackResponse
-from app.schemas.download import DownloadCreate
+
+from app.schemas.common import (
+    IDResponse,
+    MessageResponse,
+    TimestampResponse,
+)
+
+from app.schemas.download import (
+    DownloadCreate,
+    DownloadResponse,
+)
+
+from app.schemas.metadata import (
+    MusicAlbumResult,
+    MusicArtistResult,
+    MusicSearchResponse,
+    MusicTrackResult,
+)
+
+from app.schemas.playlist import (
+    PlaylistCreate,
+    PlaylistResponse,
+)
+
+from app.schemas.track import (
+    TrackResponse,
+    TrackDetailResponse,
+    TrackAvailabilityResponse,
+)
+
 from app.schemas.user import (
-    TokenResponse,
     UserCreate,
     UserLogin,
     UserResponse,
+    TokenResponse,
 )
-
-__all__ = [
-    "AlbumResponse",
-    "ArtistResponse",
-    "PlaylistCreate",
-    "PlaylistResponse",
-    "TrackResponse",
-    "TokenResponse",
-    "UserCreate",
-    "UserLogin",
-    "UserResponse",
-    "DownloadCreate",
-]
