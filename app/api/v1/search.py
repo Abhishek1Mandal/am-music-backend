@@ -1,10 +1,23 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+)
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.database import get_db
+from app.dependencies.auth import get_current_user
+from app.models.user import User
 from app.schemas.metadata import MusicSearchResponse
 from app.services.metadata.musicbrainz import (
     musicbrainz_service,
 )
+from app.services.music.download_library import (
+    get_user_downloaded_track_ids,
+)
+
 
 router = APIRouter(
     prefix="/search",
@@ -21,9 +34,8 @@ async def search_music(
         ...,
         min_length=1,
         max_length=200,
-        description="Music search query",
     ),
-    limit: int = Query(
+    limit: int | None = Query(
         default=None,
         ge=1,
         le=100,
@@ -32,11 +44,11 @@ async def search_music(
         default=0,
         ge=0,
     ),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(
+        get_current_user
+    ),
 ):
-    """
-    Search artists, albums and tracks using MusicBrainz.
-    """
-
     search_limit = (
         limit
         if limit is not None
@@ -52,17 +64,43 @@ async def search_music(
         )
 
     try:
-        return await musicbrainz_service.search(
+        response = await musicbrainz_service.search(
             query=query,
             limit=search_limit,
             offset=offset,
         )
 
+        musicbrainz_ids = [
+            track.mbid
+            for track in response.tracks
+            if track.mbid
+        ]
+
+        downloaded_track_ids = (
+            await get_user_downloaded_track_ids(
+                db,
+                current_user.id,
+                musicbrainz_ids,
+            )
+        )
+
+        for track in response.tracks:
+            track.is_downloaded = (
+                track.mbid
+                in downloaded_track_ids
+            )
+
+        return response
+
+    except HTTPException:
+        raise
+
     except Exception as exc:
+        import traceback
+
+        traceback.print_exc()
+
         raise HTTPException(
-            status_code=502,
-            detail=(
-                "Unable to fetch music metadata "
-                "from MusicBrainz."
-            ),
+            status_code=500,
+            detail=str(exc),
         ) from exc

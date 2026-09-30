@@ -221,7 +221,7 @@ class MusicBrainzService:
                     or {}
                 )
 
-                album_mbid = release_group.get("id")
+                album_mbid = release_mbid
                 release_group_mbid = release_group.get("id")
 
                 if release_mbid:

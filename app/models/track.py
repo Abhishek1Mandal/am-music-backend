@@ -3,37 +3,19 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
     String,
     Text,
-    Table,
-    Column,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.models.genre import track_genres
 
 from app.core.database import Base
-
-
-track_genres = Table(
-    "track_genres",
-    Base.metadata,
-    Column(
-        "track_id",
-        UUID(as_uuid=True),
-        ForeignKey("tracks.id", ondelete="CASCADE"),
-        primary_key=True,
-    ),
-    Column(
-        "genre_id",
-        UUID(as_uuid=True),
-        ForeignKey("genres.id", ondelete="CASCADE"),
-        primary_key=True,
-    ),
-)
 
 
 class Track(Base):
@@ -61,8 +43,8 @@ class Track(Base):
 
     title: Mapped[str] = mapped_column(
         String(255),
-        index=True,
         nullable=False,
+        index=True,
     )
 
     track_number: Mapped[int | None] = mapped_column(
@@ -102,7 +84,8 @@ class Track(Base):
     )
 
     is_available: Mapped[bool] = mapped_column(
-        default=True,
+        Boolean,
+        default=False,
         nullable=False,
     )
 
@@ -122,24 +105,6 @@ class Track(Base):
         back_populates="tracks",
     )
 
-    genres = relationship(
-        "Genre",
-        secondary=track_genres,
-        back_populates="tracks",
-    )
-
-    favorites = relationship(
-        "Favorite",
-        back_populates="track",
-        cascade="all, delete-orphan",
-    )
-
-    play_history = relationship(
-        "PlayHistory",
-        back_populates="track",
-        cascade="all, delete-orphan",
-    )
-
     library_items = relationship(
         "LibraryItem",
         back_populates="track",
@@ -149,4 +114,20 @@ class Track(Base):
     downloads = relationship(
         "Download",
         back_populates="track",
+    )
+
+    favorites = relationship(
+        "Favorite",
+        back_populates="track",
+    )
+
+    play_history = relationship(
+        "PlayHistory",
+        back_populates="track",
+    )
+
+    genres = relationship(
+        "Genre",
+        secondary=track_genres,
+        back_populates="tracks",
     )

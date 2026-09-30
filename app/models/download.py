@@ -28,11 +28,18 @@ class Download(Base):
         UUID(as_uuid=True),
         ForeignKey("tracks.id", ondelete="SET NULL"),
         nullable=True,
+        index=True,
     )
 
-    source_url: Mapped[str] = mapped_column(
+    musicbrainz_id: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        index=True,
+    )
+
+    source_url: Mapped[str | None] = mapped_column(
         Text,
-        nullable=False,
+        nullable=True,
     )
 
     status: Mapped[str] = mapped_column(

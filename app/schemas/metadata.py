@@ -39,15 +39,26 @@ class MusicTrackResult(BaseModel):
     disambiguation: str | None = None
     cover_art_url: str | None = None
 
+    is_downloaded: bool = False
+
 
 class MusicSearchResponse(BaseModel):
     query: str
     offset: int
     limit: int
     total_count: int
-    artists: list[MusicArtistResult] = Field(default_factory=list)
-    albums: list[MusicAlbumResult] = Field(default_factory=list)
-    tracks: list[MusicTrackResult] = Field(default_factory=list)
+
+    artists: list[MusicArtistResult] = Field(
+        default_factory=list
+    )
+
+    albums: list[MusicAlbumResult] = Field(
+        default_factory=list
+    )
+
+    tracks: list[MusicTrackResult] = Field(
+        default_factory=list
+    )
 
 
 class MusicSearchResult(BaseModel):
