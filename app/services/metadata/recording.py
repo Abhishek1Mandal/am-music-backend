@@ -23,7 +23,7 @@ async def get_recording(musicbrainz_id: str) -> dict[str, Any]:
 
     params = {
         "fmt": "json",
-        "inc": "artists+releases",
+        "inc": "artists+releases+media",
     }
 
     headers = {
@@ -206,6 +206,20 @@ def extract_recording_metadata(
 
     release_group_mbid = release_group.get("id")
 
+    track_number = None
+    disc_number = None
+    media = release.get("media") or []
+    if media and isinstance(media[0], dict):
+        disc_number = media[0].get("position")
+        track_list = media[0].get("tracks") or media[0].get("track-list") or []
+        for media_track in track_list:
+            if not isinstance(media_track, dict):
+                continue
+            recording = media_track.get("recording") or {}
+            if media_track.get("id") == musicbrainz_id or recording.get("id") == musicbrainz_id:
+                track_number = media_track.get("position")
+                break
+
     # ---------------------------------------------------------
     # Release date
     # ---------------------------------------------------------
@@ -242,5 +256,7 @@ def extract_recording_metadata(
         "release_mbid": release_mbid,
         "release_group_mbid": release_group_mbid,
         "release_date": release_date,
+        "track_number": track_number,
+        "disc_number": disc_number,
         "duration_ms": duration_ms,
     }

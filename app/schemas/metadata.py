@@ -28,18 +28,27 @@ class MusicAlbumResult(BaseModel):
 class MusicTrackResult(BaseModel):
     mbid: str
     title: str
+
     artist_name: str | None = None
     artist_mbid: str | None = None
+
     album_name: str | None = None
     album_mbid: str | None = None
     release_mbid: str | None = None
     release_group_mbid: str | None = None
+
     release_date: str | None = None
     duration_ms: int | None = None
     disambiguation: str | None = None
     cover_art_url: str | None = None
 
+    # Local library/download state
     is_downloaded: bool = False
+
+    # YouTube availability state
+    youtube_available: bool = False
+    youtube_url: str | None = None
+    youtube_score: float | None = None
 
 
 class MusicSearchResponse(BaseModel):

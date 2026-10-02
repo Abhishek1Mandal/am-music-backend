@@ -13,7 +13,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from app.models.genre import track_genres
 
 from app.core.database import Base
 
@@ -125,9 +124,8 @@ class Track(Base):
         "PlayHistory",
         back_populates="track",
     )
-
     genres = relationship(
         "Genre",
-        secondary=track_genres,
+        secondary="track_genres",
         back_populates="tracks",
     )

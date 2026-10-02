@@ -15,6 +15,9 @@ from app.api.v1 import (
     maintenance,
     tracks,
     streaming,
+    genres, 
+    metadata, 
+    download_progress,
 )
 
 api_router = APIRouter()
@@ -74,4 +77,16 @@ api_router.include_router(
 
 api_router.include_router(
     maintenance.router,
+)
+
+api_router.include_router(
+    genres.router,
+)
+
+api_router.include_router(
+    metadata.router,
+)
+
+api_router.include_router(
+    download_progress.router,
 )

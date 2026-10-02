@@ -2,7 +2,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "add_download_musicbrainz_id"
+revision = "215b402c91c6"
 down_revision = "4fa11d2db0da"
 branch_labels = None
 depends_on = None
