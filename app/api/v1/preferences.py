@@ -82,7 +82,26 @@ async def get_languages(
 
 
 # ============================================================
-# Existing local artist endpoint
+# Artist Search
+# ============================================================
+#
+# Flow:
+#
+# 1. Search local PostgreSQL.
+# 2. If results exist -> return them.
+# 3. If no results -> search MusicBrainz.
+# 4. Cache MusicBrainz results.
+# 5. Resolve artwork using Deezer.
+# 6. Return results.
+#
+# Supports:
+#
+# GET /preferences/artists?q=Eminem
+#
+# GET /preferences/artists?q=Eminem&language_codes=en
+#
+# GET /preferences/artists?q=Eminem&language_codes=en&limit=20
+#
 # ============================================================
 
 
@@ -96,6 +115,9 @@ async def get_artists(
         min_length=1,
         max_length=100,
     ),
+    language_codes: list[str] | None = Query(
+        default=None,
+    ),
     limit: int = Query(
         default=50,
         ge=1,
@@ -108,27 +130,544 @@ async def get_artists(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    query = select(Artist)
+    # ========================================================
+    # Normalize search query
+    # ========================================================
 
-    if q:
-        query = query.where(
-            Artist.name.ilike(
-                f"%{q.strip()}%"
+    search_query = (
+        q.strip()
+        if q
+        else None
+    )
+
+    # ========================================================
+    # Normalize language codes
+    # ========================================================
+
+    normalized_language_codes: list[str] = []
+
+    if language_codes:
+        normalized_language_codes = list(
+            dict.fromkeys(
+                code.strip().lower()
+                for code in language_codes
+                if code and code.strip()
             )
         )
 
-    query = (
-        query
+    print(
+        "[preferences/artists] "
+        f"Search query: {search_query}"
+    )
+
+    print(
+        "[preferences/artists] "
+        f"Language codes: "
+        f"{normalized_language_codes}"
+    )
+
+    print(
+        "[preferences/artists] "
+        f"Limit: {limit}, Offset: {offset}"
+    )
+
+    # ========================================================
+    # No search query
+    #
+    # Return cached/local artists.
+    # ========================================================
+
+    if not search_query:
+
+        query = select(Artist)
+
+        # ----------------------------------------------------
+        # Optional language filtering.
+        # ----------------------------------------------------
+
+        if normalized_language_codes:
+            query = query.where(
+                Artist.language_codes.overlap(
+                    normalized_language_codes
+                )
+            )
+
+        query = (
+            query
+            .order_by(
+                Artist.name.asc(),
+                Artist.id.asc(),
+            )
+            .offset(offset)
+            .limit(limit)
+        )
+
+        result = await db.execute(query)
+
+        artists = result.scalars().all()
+
+        print(
+            "[preferences/artists] "
+            f"Returning {len(artists)} "
+            "local artists."
+        )
+
+        return [
+            PreferredArtistResponse(
+                id=artist.id,
+                name=artist.name,
+                musicbrainz_id=(
+                    artist.musicbrainz_id
+                ),
+                image_url=artist.image_url,
+            )
+            for artist in artists
+        ]
+
+    # ========================================================
+    # Search PostgreSQL first
+    # ========================================================
+
+    local_query = (
+        select(Artist)
+        .where(
+            Artist.name.ilike(
+                f"%{search_query}%"
+            )
+        )
+    )
+
+    # --------------------------------------------------------
+    # Apply language filtering when provided.
+    # --------------------------------------------------------
+
+    if normalized_language_codes:
+        local_query = local_query.where(
+            Artist.language_codes.overlap(
+                normalized_language_codes
+            )
+        )
+
+    local_query = (
+        local_query
         .order_by(
-            Artist.name.asc()
+            Artist.name.asc(),
+            Artist.id.asc(),
         )
         .offset(offset)
         .limit(limit)
     )
 
-    result = await db.execute(query)
+    local_result = await db.execute(
+        local_query
+    )
 
-    artists = result.scalars().all()
+    local_artists = list(
+        local_result.scalars().all()
+    )
+
+    print(
+        "[preferences/artists] "
+        f"Local search returned "
+        f"{len(local_artists)} results."
+    )
+
+    # ========================================================
+    # Local results found
+    #
+    # Do NOT call MusicBrainz.
+    # ========================================================
+
+    if local_artists:
+
+        print(
+            "[preferences/artists] "
+            "Using local PostgreSQL results."
+        )
+
+        return [
+            PreferredArtistResponse(
+                id=artist.id,
+                name=artist.name,
+                musicbrainz_id=(
+                    artist.musicbrainz_id
+                ),
+                image_url=artist.image_url,
+            )
+            for artist in local_artists
+        ]
+
+    # ========================================================
+    # No local results.
+    #
+    # Search MusicBrainz.
+    # ========================================================
+
+    print(
+        "[preferences/artists] "
+        f"No local results for "
+        f"'{search_query}'."
+    )
+
+    print(
+        "[preferences/artists] "
+        "Searching MusicBrainz..."
+    )
+
+    try:
+        discovered_artists, total = (
+            await musicbrainz_service.search_artists(
+                query=search_query,
+                limit=limit,
+                offset=offset,
+            )
+        )
+
+        print(
+            "[preferences/artists] "
+            f"MusicBrainz returned "
+            f"{len(discovered_artists)} "
+            f"artists."
+        )
+
+        print(
+            "[preferences/artists] "
+            f"MusicBrainz total: {total}"
+        )
+
+    except Exception as exc:
+
+        print(
+            "[preferences/artists] "
+            "MusicBrainz search failed."
+        )
+
+        print(
+            f"Error type: {type(exc).__name__}"
+        )
+
+        print(
+            f"Error: {exc}"
+        )
+
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE
+            ),
+            detail=(
+                "Artist search failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        ) from exc
+
+    # ========================================================
+    # No MusicBrainz results
+    # ========================================================
+
+    if not discovered_artists:
+
+        print(
+            "[preferences/artists] "
+            f"No MusicBrainz results for "
+            f"'{search_query}'."
+        )
+
+        return []
+
+    # ========================================================
+    # Cache MusicBrainz results
+    # ========================================================
+
+    pending_artists: dict[str, Artist] = {}
+
+    response_artists: list[Artist] = []
+
+    try:
+
+        for metadata in discovered_artists:
+
+            mbid = metadata.mbid
+
+            if not mbid:
+                continue
+
+            # ------------------------------------------------
+            # Prevent duplicate MBIDs during this request.
+            # ------------------------------------------------
+
+            if mbid in pending_artists:
+
+                artist = pending_artists[mbid]
+
+                response_artists.append(
+                    artist
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Check database by MusicBrainz MBID.
+            # ------------------------------------------------
+
+            result = await db.execute(
+                select(Artist).where(
+                    Artist.musicbrainz_id
+                    == mbid
+                )
+            )
+
+            artist = (
+                result.scalar_one_or_none()
+            )
+
+            # ------------------------------------------------
+            # Existing artist.
+            # ------------------------------------------------
+
+            if artist is not None:
+
+                print(
+                    "[preferences/artists] "
+                    f"Existing artist: "
+                    f"{artist.name}"
+                )
+
+                # ------------------------------------------------
+                # If a language was provided, add it to the
+                # cached artist.
+                # ------------------------------------------------
+
+                if normalized_language_codes:
+
+                    current_languages = (
+                        artist.language_codes
+                        or []
+                    )
+
+                    changed = False
+
+                    for language_code in (
+                        normalized_language_codes
+                    ):
+
+                        if (
+                            language_code
+                            not in current_languages
+                        ):
+                            current_languages.append(
+                                language_code
+                            )
+
+                            changed = True
+
+                    if changed:
+                        artist.language_codes = (
+                            current_languages
+                        )
+
+                pending_artists[mbid] = artist
+
+                response_artists.append(
+                    artist
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # Create new artist.
+            # ------------------------------------------------
+
+            artist_languages = (
+                normalized_language_codes.copy()
+            )
+
+            artist = Artist(
+                name=metadata.name,
+                sort_name=metadata.sort_name,
+                musicbrainz_id=mbid,
+                image_url=None,
+                biography=None,
+                language_codes=artist_languages,
+            )
+
+            db.add(artist)
+
+            pending_artists[mbid] = artist
+
+            response_artists.append(
+                artist
+            )
+
+            print(
+                "[preferences/artists] "
+                f"Creating artist: "
+                f"{metadata.name} "
+                f"({mbid})"
+            )
+
+        # ----------------------------------------------------
+        # Flush first.
+        #
+        # This assigns UUIDs to newly created Artist objects.
+        # ----------------------------------------------------
+
+        await db.flush()
+
+        print(
+            "[preferences/artists] "
+            f"Prepared "
+            f"{len(pending_artists)} "
+            "unique artists."
+        )
+
+        # ----------------------------------------------------
+        # Commit artists.
+        # ----------------------------------------------------
+
+        await db.commit()
+
+        print(
+            "[preferences/artists] "
+            "Artists committed successfully."
+        )
+
+    except Exception as exc:
+
+        print(
+            "[preferences/artists] "
+            "ERROR while caching MusicBrainz artists."
+        )
+
+        print(
+            f"Error type: {type(exc).__name__}"
+        )
+
+        print(
+            f"Error: {exc}"
+        )
+
+        traceback.print_exc()
+
+        await db.rollback()
+
+        # ----------------------------------------------------
+        # Important:
+        #
+        # MusicBrainz already gave us valid results.
+        # If database caching fails, we still return the
+        # MusicBrainz data without failing the search.
+        # ----------------------------------------------------
+
+        response_artists = []
+
+        for metadata in discovered_artists:
+
+            if not metadata.mbid:
+                continue
+
+            response_artists.append(
+                Artist(
+                    name=metadata.name,
+                    sort_name=metadata.sort_name,
+                    musicbrainz_id=metadata.mbid,
+                    image_url=None,
+                    biography=None,
+                    language_codes=(
+                        normalized_language_codes.copy()
+                    ),
+                )
+            )
+
+    # ========================================================
+    # Resolve artwork
+    #
+    # Only resolve artwork for the returned page.
+    # ========================================================
+
+    async def resolve_image(
+        artist: Artist,
+    ) -> None:
+
+        if artist.image_url:
+            return
+
+        try:
+
+            image_url = (
+                await deezer_service
+                .get_artist_image(
+                    artist.name
+                )
+            )
+
+            if image_url:
+
+                artist.image_url = (
+                    image_url
+                )
+
+                print(
+                    "[preferences/artists] "
+                    f"Artwork found for "
+                    f"{artist.name}"
+                )
+
+        except Exception as exc:
+
+            print(
+                "[preferences/artists] "
+                f"Artwork lookup failed "
+                f"for {artist.name}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            # Artwork is optional.
+            # Never fail artist search.
+
+    await asyncio.gather(
+        *(
+            resolve_image(artist)
+            for artist in response_artists
+        )
+    )
+
+    # ========================================================
+    # Save artwork changes
+    # ========================================================
+
+    try:
+
+        await db.commit()
+
+        print(
+            "[preferences/artists] "
+            "Artwork changes committed."
+        )
+
+    except Exception as exc:
+
+        print(
+            "[preferences/artists] "
+            "Artwork commit failed."
+        )
+
+        print(
+            f"Error type: {type(exc).__name__}"
+        )
+
+        print(
+            f"Error: {exc}"
+        )
+
+        traceback.print_exc()
+
+        await db.rollback()
+
+    # ========================================================
+    # Response
+    # ========================================================
 
     return [
         PreferredArtistResponse(
@@ -139,12 +678,13 @@ async def get_artists(
             ),
             image_url=artist.image_url,
         )
-        for artist in artists
+        for artist in response_artists
+        if artist.musicbrainz_id
     ]
 
 
 # ============================================================
-# Language-based artist discovery
+# Language-based Artist Discovery
 # ============================================================
 
 
@@ -189,11 +729,12 @@ async def discover_artists(
 
     print(
         "[discover-artists] "
-        f"Requested languages: {language_codes}"
+        f"Requested languages: "
+        f"{language_codes}"
     )
 
     # --------------------------------------------------------
-    # Validate languages against database.
+    # Validate languages.
     # --------------------------------------------------------
 
     language_result = await db.execute(
@@ -218,7 +759,9 @@ async def discover_artists(
 
     if invalid_codes:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=(
+                status.HTTP_400_BAD_REQUEST
+            ),
             detail=(
                 "Unsupported language codes: "
                 + ", ".join(invalid_codes)
@@ -231,14 +774,7 @@ async def discover_artists(
     )
 
     # --------------------------------------------------------
-    # Populate a larger cache than the requested page.
-    #
-    # Example:
-    #
-    # limit=20
-    # offset=0
-    #
-    # We populate at least 100 artists.
+    # We always populate at least 100 artists.
     # --------------------------------------------------------
 
     required_count = max(
@@ -256,6 +792,7 @@ async def discover_artists(
     # --------------------------------------------------------
 
     try:
+
         cached_result = await db.execute(
             select(Artist)
             .where(
@@ -275,13 +812,15 @@ async def discover_artists(
 
         print(
             "[discover-artists] "
-            f"Cached artists: {len(cached_artists)}"
+            f"Cached artists: "
+            f"{len(cached_artists)}"
         )
 
     except Exception as exc:
+
         print(
             "[discover-artists] "
-            "ERROR while querying cached artists:"
+            "ERROR while querying cached artists."
         )
 
         print(
@@ -305,7 +844,7 @@ async def discover_artists(
         ) from exc
 
     # --------------------------------------------------------
-    # Populate cache from MusicBrainz.
+    # Discover from MusicBrainz when cache is insufficient.
     # --------------------------------------------------------
 
     if len(cached_artists) < required_count:
@@ -317,26 +856,12 @@ async def discover_artists(
         )
 
         try:
+
             # ------------------------------------------------
-            # IMPORTANT:
-            #
-            # MusicBrainz can return the same artist for
-            # multiple languages.
-            #
-            # Example:
-            #
-            # Hindi -> Sanjay Leela Bhansali
-            # Telugu -> Sanjay Leela Bhansali
-            #
-            # We keep all artists discovered during this
-            # request in this dictionary by MBID.
+            # Prevent duplicate MBIDs across languages.
             # ------------------------------------------------
 
             pending_artists: dict[str, Artist] = {}
-
-            # ------------------------------------------------
-            # Search each selected language.
-            # ------------------------------------------------
 
             for language_code in language_codes:
 
@@ -361,10 +886,6 @@ async def discover_artists(
                     f"for {language_code}"
                 )
 
-                # ------------------------------------------------
-                # Process each discovered artist.
-                # ------------------------------------------------
-
                 for metadata in discovered:
 
                     mbid = metadata.mbid
@@ -372,19 +893,15 @@ async def discover_artists(
                     if not mbid:
                         continue
 
-                    # --------------------------------------------
-                    # CASE 1:
-                    #
-                    # Artist was already discovered during this
-                    # request.
-                    #
-                    # This prevents duplicate INSERTs when the
-                    # same artist appears in multiple languages.
-                    # --------------------------------------------
+                    # ----------------------------------------
+                    # Already discovered during this request.
+                    # ----------------------------------------
 
                     if mbid in pending_artists:
 
-                        artist = pending_artists[mbid]
+                        artist = (
+                            pending_artists[mbid]
+                        )
 
                         current_languages = (
                             artist.language_codes
@@ -395,26 +912,17 @@ async def discover_artists(
                             language_code
                             not in current_languages
                         ):
+
                             artist.language_codes = (
                                 current_languages
                                 + [language_code]
                             )
 
-                            print(
-                                "[discover-artists] "
-                                f"Added language "
-                                f"{language_code} to "
-                                f"{artist.name}"
-                            )
-
                         continue
 
-                    # --------------------------------------------
-                    # CASE 2:
-                    #
-                    # Check whether the artist already exists
-                    # in PostgreSQL.
-                    # --------------------------------------------
+                    # ----------------------------------------
+                    # Check DB.
+                    # ----------------------------------------
 
                     result = await db.execute(
                         select(Artist).where(
@@ -427,19 +935,11 @@ async def discover_artists(
                         result.scalar_one_or_none()
                     )
 
-                    # --------------------------------------------
-                    # CASE 2A:
-                    #
-                    # Artist already exists in database.
-                    # --------------------------------------------
+                    # ----------------------------------------
+                    # Existing artist.
+                    # ----------------------------------------
 
                     if artist is not None:
-
-                        print(
-                            "[discover-artists] "
-                            f"Updating existing artist: "
-                            f"{metadata.name}"
-                        )
 
                         artist.name = (
                             metadata.name
@@ -458,23 +958,21 @@ async def discover_artists(
                             language_code
                             not in current_languages
                         ):
+
                             artist.language_codes = (
                                 current_languages
                                 + [language_code]
                             )
 
-                        # Put existing artist into the
-                        # request cache as well.
-                        pending_artists[mbid] = artist
+                        pending_artists[mbid] = (
+                            artist
+                        )
 
                         continue
 
-                    # --------------------------------------------
-                    # CASE 2B:
-                    #
-                    # Artist does not exist.
-                    # Create it.
-                    # --------------------------------------------
+                    # ----------------------------------------
+                    # New artist.
+                    # ----------------------------------------
 
                     artist = Artist(
                         name=metadata.name,
@@ -489,31 +987,14 @@ async def discover_artists(
 
                     db.add(artist)
 
-                    # --------------------------------------------
-                    # IMPORTANT:
-                    #
-                    # Add it immediately to pending_artists.
-                    #
-                    # This prevents the same MBID from being
-                    # inserted twice before db.commit().
-                    # --------------------------------------------
-
-                    pending_artists[mbid] = artist
-
-                    print(
-                        "[discover-artists] "
-                        f"Creating artist: "
-                        f"{metadata.name} "
-                        f"({mbid})"
+                    pending_artists[mbid] = (
+                        artist
                     )
-
-            # ------------------------------------------------
-            # Commit all artists once.
-            # ------------------------------------------------
 
             print(
                 "[discover-artists] "
-                f"Prepared {len(pending_artists)} "
+                f"Prepared "
+                f"{len(pending_artists)} "
                 "unique artists."
             )
 
@@ -529,7 +1010,7 @@ async def discover_artists(
 
             print(
                 "[discover-artists] "
-                "ERROR during MusicBrainz discovery:"
+                "ERROR during MusicBrainz discovery."
             )
 
             print(
@@ -544,10 +1025,6 @@ async def discover_artists(
 
             await db.rollback()
 
-            # ------------------------------------------------
-            # If there was no cache, discovery cannot continue.
-            # ------------------------------------------------
-
             if not cached_artists:
 
                 raise HTTPException(
@@ -560,21 +1037,18 @@ async def discover_artists(
                     ),
                 ) from exc
 
-            # ------------------------------------------------
-            # Existing cached data can still be returned.
-            # ------------------------------------------------
-
             print(
                 "[discover-artists] "
-                "Discovery failed, but cached artists "
-                "exist. Continuing with cache."
+                "Discovery failed, but cached "
+                "artists exist."
             )
 
     # --------------------------------------------------------
-    # Reload artists after MusicBrainz discovery.
+    # Reload cached artists.
     # --------------------------------------------------------
 
     try:
+
         cached_result = await db.execute(
             select(Artist)
             .where(
@@ -602,7 +1076,7 @@ async def discover_artists(
 
         print(
             "[discover-artists] "
-            "ERROR while loading final artist list:"
+            "ERROR while loading final artist list."
         )
 
         print(
@@ -644,9 +1118,7 @@ async def discover_artists(
     )
 
     # --------------------------------------------------------
-    # Resolve artwork only for returned artists.
-    #
-    # Artwork failure must never fail discovery.
+    # Artwork
     # --------------------------------------------------------
 
     async def resolve_image(
@@ -657,6 +1129,7 @@ async def discover_artists(
             return
 
         try:
+
             image_url = (
                 await deezer_service
                 .get_artist_image(
@@ -665,7 +1138,10 @@ async def discover_artists(
             )
 
             if image_url:
-                artist.image_url = image_url
+
+                artist.image_url = (
+                    image_url
+                )
 
                 print(
                     "[discover-artists] "
@@ -682,9 +1158,6 @@ async def discover_artists(
                 f"{type(exc).__name__}: {exc}"
             )
 
-            # Artwork is optional.
-            # Never fail artist discovery.
-
     await asyncio.gather(
         *(
             resolve_image(artist)
@@ -693,17 +1166,18 @@ async def discover_artists(
     )
 
     # --------------------------------------------------------
-    # Commit artwork changes.
+    # Commit artwork.
     # --------------------------------------------------------
 
     try:
+
         await db.commit()
 
     except Exception as exc:
 
         print(
             "[discover-artists] "
-            "ERROR while committing artwork:"
+            "ERROR while committing artwork."
         )
 
         print(
@@ -718,10 +1192,8 @@ async def discover_artists(
 
         await db.rollback()
 
-        # Artwork is optional.
-
     # --------------------------------------------------------
-    # Build response.
+    # Response.
     # --------------------------------------------------------
 
     response_artists = [
@@ -741,10 +1213,6 @@ async def discover_artists(
         for artist in page
         if artist.musicbrainz_id
     ]
-
-    # --------------------------------------------------------
-    # Return response.
-    # --------------------------------------------------------
 
     return DiscoverArtistsResponse(
         languages=language_codes,
@@ -807,7 +1275,7 @@ async def get_preference_status(
 
 
 # ============================================================
-# Get preferences
+# Get Preferences
 # ============================================================
 
 
@@ -886,7 +1354,7 @@ async def get_preferences(
 
 
 # ============================================================
-# Save onboarding
+# Save Onboarding Preferences
 # ============================================================
 
 
@@ -912,7 +1380,12 @@ async def save_onboarding_preferences(
         )
     )
 
+    # --------------------------------------------------------
+    # Languages are required.
+    # --------------------------------------------------------
+
     if not language_ids:
+
         raise HTTPException(
             status_code=(
                 status.HTTP_422_UNPROCESSABLE_ENTITY
@@ -922,6 +1395,10 @@ async def save_onboarding_preferences(
                 "must be selected."
             ),
         )
+
+    # --------------------------------------------------------
+    # Validate languages.
+    # --------------------------------------------------------
 
     language_result = await db.execute(
         select(Language).where(
@@ -939,6 +1416,7 @@ async def save_onboarding_preferences(
     if len(languages) != len(
         language_ids
     ):
+
         raise HTTPException(
             status_code=(
                 status.HTTP_400_BAD_REQUEST
@@ -949,7 +1427,12 @@ async def save_onboarding_preferences(
             ),
         )
 
+    # --------------------------------------------------------
+    # Validate artists.
+    # --------------------------------------------------------
+
     if artist_ids:
+
         artist_result = await db.execute(
             select(Artist).where(
                 Artist.id.in_(
@@ -965,6 +1448,7 @@ async def save_onboarding_preferences(
         if len(artists) != len(
             artist_ids
         ):
+
             raise HTTPException(
                 status_code=(
                     status.HTTP_400_BAD_REQUEST
@@ -976,7 +1460,12 @@ async def save_onboarding_preferences(
             )
 
     else:
+
         artists = []
+
+    # --------------------------------------------------------
+    # Remove old language preferences.
+    # --------------------------------------------------------
 
     await db.execute(
         delete(UserLanguage).where(
@@ -984,6 +1473,10 @@ async def save_onboarding_preferences(
             == current_user.id
         )
     )
+
+    # --------------------------------------------------------
+    # Remove old artist preferences.
+    # --------------------------------------------------------
 
     await db.execute(
         delete(
@@ -994,7 +1487,12 @@ async def save_onboarding_preferences(
         )
     )
 
+    # --------------------------------------------------------
+    # Save languages.
+    # --------------------------------------------------------
+
     for language_id in language_ids:
+
         db.add(
             UserLanguage(
                 user_id=current_user.id,
@@ -1002,7 +1500,12 @@ async def save_onboarding_preferences(
             )
         )
 
+    # --------------------------------------------------------
+    # Save artists.
+    # --------------------------------------------------------
+
     for artist_id in artist_ids:
+
         db.add(
             UserArtistPreference(
                 user_id=current_user.id,
@@ -1010,9 +1513,17 @@ async def save_onboarding_preferences(
             )
         )
 
+    # --------------------------------------------------------
+    # Mark onboarding complete.
+    # --------------------------------------------------------
+
     current_user.onboarding_completed = True
 
     await db.commit()
+
+    # --------------------------------------------------------
+    # Return saved preferences.
+    # --------------------------------------------------------
 
     return PreferencesResponse(
         onboarding_completed=True,
