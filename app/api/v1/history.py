@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -8,34 +10,23 @@ from app.models.play_history import PlayHistory
 from app.models.track import Track
 from app.models.user import User
 
+
 router = APIRouter(
     prefix="/history",
     tags=["History"],
 )
 
 
-@router.get("")
+@router.get("", summary="Get Listening History")
 async def get_history(
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
     Get the authenticated user's listening history.
     """
-
-    if limit < 1 or limit > 100:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Limit must be between 1 and 100.",
-        )
-
-    if offset < 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Offset cannot be negative.",
-        )
 
     result = await db.execute(
         select(PlayHistory, Track)
@@ -65,6 +56,9 @@ async def get_history(
                 "title": track.title,
                 "artist_id": track.artist_id,
                 "album_id": track.album_id,
+                "duration_ms": track.duration_ms,
+                "musicbrainz_id": track.musicbrainz_id,
+                "is_available": track.is_available,
                 "played_at": history.played_at,
             }
         )
@@ -80,9 +74,10 @@ async def get_history(
 @router.post(
     "/{track_id}",
     status_code=status.HTTP_201_CREATED,
+    summary="Record Track Play",
 )
 async def record_history(
-    track_id: int,
+    track_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -122,9 +117,12 @@ async def record_history(
     }
 
 
-@router.get("/{history_id}")
+@router.get(
+    "/{history_id}",
+    summary="Get History Entry",
+)
 async def get_history_item(
-    history_id: int,
+    history_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -160,13 +158,19 @@ async def get_history_item(
         "title": track.title,
         "artist_id": track.artist_id,
         "album_id": track.album_id,
+        "duration_ms": track.duration_ms,
+        "musicbrainz_id": track.musicbrainz_id,
+        "is_available": track.is_available,
         "played_at": history.played_at,
     }
 
 
-@router.delete("/{history_id}")
+@router.delete(
+    "/{history_id}",
+    summary="Delete History Entry",
+)
 async def delete_history_item(
-    history_id: int,
+    history_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -190,7 +194,6 @@ async def delete_history_item(
         )
 
     await db.delete(history)
-
     await db.commit()
 
     return {
@@ -199,7 +202,10 @@ async def delete_history_item(
     }
 
 
-@router.delete("")
+@router.delete(
+    "",
+    summary="Clear Listening History",
+)
 async def clear_history(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),

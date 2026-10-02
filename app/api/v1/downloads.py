@@ -8,7 +8,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    Query,
+    status,
+)
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +57,16 @@ ACTIVE_DOWNLOAD_STATUSES = {
     "resolving",
     "downloading",
     "processing",
+}
+
+DOWNLOAD_STATUSES = {
+    "pending",
+    "resolving",
+    "downloading",
+    "processing",
+    "completed",
+    "failed",
+    "cancelled",
 }
 
 
@@ -236,6 +253,21 @@ async def get_download_by_id(
     )
 
     return result.scalar_one_or_none()
+
+
+async def is_download_cancelled(
+    db: AsyncSession,
+    download_id: UUID,
+) -> bool:
+    """Return True when the download has been cancelled."""
+
+    result = await db.execute(
+        select(Download.status).where(
+            Download.id == download_id,
+        )
+    )
+
+    return result.scalar_one_or_none() == "cancelled"
 
 
 async def get_existing_track(
@@ -768,6 +800,14 @@ async def mark_download_failed(
                 )
                 return
 
+            # Never overwrite an explicit user cancellation with failed.
+            if download.status == "cancelled":
+                logger.info(
+                    "[DOWNLOAD] Download %s was cancelled; preserving cancelled status.",
+                    download_id,
+                )
+                return
+
             download.status = "failed"
             download.error_message = error_message
             download.completed_at = None
@@ -845,6 +885,13 @@ async def process_download(
                 )
                 return
 
+            if download.status == "cancelled":
+                logger.info(
+                    "[DOWNLOAD] Download %s was cancelled before processing.",
+                    download_id,
+                )
+                return
+
             # ==================================================
             # Check existing Track
             # ==================================================
@@ -888,6 +935,16 @@ async def process_download(
                     )
 
                     return
+
+            if await is_download_cancelled(
+                db,
+                download_id,
+            ):
+                logger.info(
+                    "[DOWNLOAD] Download %s cancelled before resolution.",
+                    download_id,
+                )
+                return
 
             # ==================================================
             # Fetch MusicBrainz recording
@@ -973,6 +1030,16 @@ async def process_download(
                 "[DOWNLOAD] Starting audio download..."
             )
 
+            if await is_download_cancelled(
+                db,
+                download_id,
+            ):
+                logger.info(
+                    "[DOWNLOAD] Download %s cancelled before audio download.",
+                    download_id,
+                )
+                return
+
             download_result = await asyncio.to_thread(
                 download_audio,
                 resolved_source.url,
@@ -996,6 +1063,17 @@ async def process_download(
                 raise RuntimeError(
                     f"Downloaded file does not exist: {file_path}",
                 )
+
+            if await is_download_cancelled(
+                db,
+                download_id,
+            ):
+                logger.info(
+                    "[DOWNLOAD] Download %s was cancelled after audio download. Cleaning up file.",
+                    download_id,
+                )
+                delete_file_safely(file_path)
+                return
 
             logger.info(
                 "[DOWNLOAD] Audio downloaded: %s",
@@ -1080,6 +1158,17 @@ async def process_download(
             # ==================================================
             # Complete
             # ==================================================
+
+            if await is_download_cancelled(
+                db,
+                download_id,
+            ):
+                logger.info(
+                    "[DOWNLOAD] Download %s cancelled before completion. Cleaning up file.",
+                    download_id,
+                )
+                delete_file_safely(file_path)
+                return
 
             download.track_id = track.id
             download.file_path = str(file_path)
@@ -1349,16 +1438,51 @@ async def create_download(
     summary="Get Downloads",
 )
 async def get_downloads(
+    page: int = Query(
+        default=1,
+        ge=1,
+        description="Page number.",
+    ),
+    limit: int = Query(
+        default=20,
+        ge=1,
+        le=100,
+        description="Number of downloads per page.",
+    ),
+    status_filter: str | None = Query(
+        default=None,
+        alias="status",
+        description="Filter by download status.",
+    ),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[DownloadResponse]:
     """
-    Return downloads belonging to the authenticated user.
+    Return the authenticated user's downloads.
 
-    is_downloaded is calculated from the actual physical file.
+    Supports pagination and optional status filtering.
+
+    Examples:
+        GET /api/v1/downloads?page=1&limit=20
+        GET /api/v1/downloads?status=completed
+        GET /api/v1/downloads?page=2&limit=10&status=failed
     """
 
-    result = await db.execute(
+    if status_filter is not None:
+        status_filter = status_filter.strip().lower()
+
+        if status_filter not in DOWNLOAD_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Invalid download status. Allowed values: "
+                    + ", ".join(sorted(DOWNLOAD_STATUSES))
+                ),
+            )
+
+    offset = (page - 1) * limit
+
+    query = (
         select(Download)
         .where(
             Download.user_id == current_user.id,
@@ -1366,7 +1490,16 @@ async def get_downloads(
         .order_by(
             Download.created_at.desc(),
         )
+        .offset(offset)
+        .limit(limit)
     )
+
+    if status_filter is not None:
+        query = query.where(
+            Download.status == status_filter,
+        )
+
+    result = await db.execute(query)
 
     downloads = list(
         result.scalars().all()
@@ -1375,20 +1508,213 @@ async def get_downloads(
     responses: list[DownloadResponse] = []
 
     for download in downloads:
-
-        response = await build_download_response(
-            db,
-            download,
-        )
-
         responses.append(
-            response,
+            await build_download_response(
+                db,
+                download,
+            )
         )
 
     # Persist availability changes caused by missing files.
     await db.commit()
 
     return responses
+
+
+# ============================================================
+# RETRY DOWNLOAD
+# ============================================================
+
+
+@router.post(
+    "/{download_id}/retry",
+    response_model=DownloadResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Retry Download",
+)
+async def retry_download(
+    download_id: UUID,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> DownloadResponse:
+    """Retry a failed or cancelled download."""
+
+    result = await db.execute(
+        select(Download).where(
+            Download.id == download_id,
+            Download.user_id == current_user.id,
+        )
+    )
+
+    download = result.scalar_one_or_none()
+
+    if download is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Download not found.",
+        )
+
+    if download.status in ACTIVE_DOWNLOAD_STATUSES:
+        return await build_download_response(
+            db,
+            download,
+        )
+
+    if download.status == "completed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Download is already completed.",
+        )
+
+    if download.status not in {"failed", "cancelled"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Download cannot be retried from status "
+                f"'{download.status}'."
+            ),
+        )
+
+    musicbrainz_id = download.musicbrainz_id
+
+    if not musicbrainz_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Download does not have a MusicBrainz recording ID.",
+        )
+
+    await acquire_download_lock(
+        db,
+        current_user.id,
+        musicbrainz_id,
+    )
+
+    active_download = await get_active_download(
+        db,
+        current_user.id,
+        musicbrainz_id,
+    )
+
+    if active_download is not None and active_download.id != download.id:
+        await db.commit()
+        return await build_download_response(
+            db,
+            active_download,
+        )
+
+    download.status = "pending"
+    download.source_url = None
+    download.error_message = None
+    download.completed_at = None
+    download.file_path = None
+    download.track_id = None
+
+    await db.commit()
+    await db.refresh(download)
+
+    logger.info(
+        "[DOWNLOAD] Retrying: id=%s mbid=%s user=%s",
+        download.id,
+        musicbrainz_id,
+        current_user.id,
+    )
+
+    background_tasks.add_task(
+        process_download,
+        download.id,
+        current_user.id,
+        musicbrainz_id,
+    )
+
+    return await build_download_response(
+        db,
+        download,
+    )
+
+
+# ============================================================
+# CANCEL DOWNLOAD
+# ============================================================
+
+
+@router.post(
+    "/{download_id}/cancel",
+    response_model=DownloadResponse,
+    summary="Cancel Download",
+)
+async def cancel_download(
+    download_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> DownloadResponse:
+    """
+    Cancel a pending or active download.
+
+    Cancellation is cooperative. If yt-dlp is already running,
+    the worker finishes the current operation, detects the cancelled
+    state, removes the downloaded file, and exits.
+    """
+
+    result = await db.execute(
+        select(Download).where(
+            Download.id == download_id,
+            Download.user_id == current_user.id,
+        )
+    )
+
+    download = result.scalar_one_or_none()
+
+    if download is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Download not found.",
+        )
+
+    if download.status == "cancelled":
+        return await build_download_response(
+            db,
+            download,
+        )
+
+    if download.status == "completed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Completed downloads cannot be cancelled.",
+        )
+
+    if download.status == "failed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Failed downloads cannot be cancelled. Use retry instead.",
+        )
+
+    if download.status not in ACTIVE_DOWNLOAD_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Download cannot be cancelled from status "
+                f"'{download.status}'."
+            ),
+        )
+
+    download.status = "cancelled"
+    download.error_message = "Download cancelled by user."
+    download.completed_at = None
+
+    await db.commit()
+    await db.refresh(download)
+
+    logger.info(
+        "[DOWNLOAD] Cancelled: id=%s user=%s",
+        download.id,
+        current_user.id,
+    )
+
+    return await build_download_response(
+        db,
+        download,
+    )
 
 
 # ============================================================

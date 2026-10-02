@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.v1 import (
     albums,
     artists,
+    artwork,
     auth,
     downloads,
     favorites,
@@ -11,7 +12,9 @@ from app.api.v1 import (
     library,
     playlists,
     search,
+    maintenance,
     tracks,
+    streaming,
 )
 
 api_router = APIRouter()
@@ -59,4 +62,16 @@ api_router.include_router(
 
 api_router.include_router(
     downloads.router,
+)
+
+api_router.include_router(
+    streaming.router,
+)
+
+api_router.include_router(
+    artwork.router,
+)
+
+api_router.include_router(
+    maintenance.router,
 )
