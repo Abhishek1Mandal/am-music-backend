@@ -82,6 +82,12 @@ class Track(Base):
         nullable=True,
     )
 
+    language_code: Mapped[str | None] = mapped_column(
+        String(10),
+        nullable=True,
+        index=True,
+    )
+
     is_available: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
@@ -124,6 +130,7 @@ class Track(Base):
         "PlayHistory",
         back_populates="track",
     )
+
     genres = relationship(
         "Genre",
         secondary="track_genres",

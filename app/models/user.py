@@ -1,11 +1,16 @@
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, DateTime, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+
+if TYPE_CHECKING:
+    from app.models.user_artist_preference import UserArtistPreference
+    from app.models.user_language import UserLanguage
 
 
 class User(Base):
@@ -39,6 +44,13 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         default=True,
+        nullable=False,
+    )
+
+    onboarding_completed: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
         nullable=False,
     )
 
@@ -81,6 +93,18 @@ class User(Base):
 
     downloads = relationship(
         "Download",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+    language_preferences: Mapped[list["UserLanguage"]] = relationship(
+        "UserLanguage",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+    artist_preferences: Mapped[list["UserArtistPreference"]] = relationship(
+        "UserArtistPreference",
         back_populates="user",
         cascade="all, delete-orphan",
     )

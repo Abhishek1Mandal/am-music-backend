@@ -15,11 +15,13 @@ from app.models import (  # noqa: F401
     Download,
     Favorite,
     Genre,
-    LibraryItem,
+    Language,
     PlayHistory,
     Playlist,
     Track,
     User,
+    UserArtistPreference,
+    UserLanguage,
 )
 
 config = context.config

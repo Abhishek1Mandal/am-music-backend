@@ -13,38 +13,74 @@ from app.schemas.metadata import (
     MusicSearchResponse,
     MusicTrackResult,
 )
-from app.services.metadata.cover_art import cover_art_service
+from app.services.metadata.cover_art import (
+    cover_art_service,
+)
 
 
 class MusicBrainzService:
     """
-    MusicBrainz API service.
+    MusicBrainz API client.
 
     Responsibilities:
-        - Artist search
-        - Release/album search
-        - Recording/track search
-        - Combined search
-        - Automatic retry for temporary MusicBrainz failures
+    - Artist search
+    - Artist lookup
+    - Album/release search
+    - Recording/track search
+    - Language-based artist discovery
+    - Retry handling
+    - Rate-limit protection
+    - HTTP error handling
     """
 
-    # HTTP status codes that indicate a temporary failure.
-    RETRYABLE_STATUS_CODES = {
-        429,  # Too Many Requests
-        500,  # Internal Server Error
-        502,  # Bad Gateway
-        503,  # Service Unavailable
-        504,  # Gateway Timeout
+    # ======================================================
+    # MusicBrainz language mapping
+    # ======================================================
+
+    LANGUAGE_639_1_TO_639_3 = {
+        "en": "eng",
+        "hi": "hin",
+        "te": "tel",
+        "ta": "tam",
+        "ml": "mal",
+        "kn": "kan",
+        "bn": "ben",
+        "pa": "pan",
+        "mr": "mar",
+        "gu": "guj",
+        "bho": "bho",
+        "or": "ori",
+        "as": "asm",
+        "ur": "urd",
+        "kok": "kok",
+        "raj": "raj",
     }
 
-    # Number of retries AFTER the initial request.
+    # ======================================================
+    # HTTP / retry configuration
+    # ======================================================
+
+    RETRYABLE_STATUS_CODES = {
+        429,
+        500,
+        502,
+        503,
+        504,
+    }
+
     MAX_RETRIES = 3
 
-    # Base delay for exponential backoff.
-    RETRY_BASE_DELAY = 1.0
+    BASE_RETRY_DELAY = 1.0
 
-    # Maximum retry delay.
-    RETRY_MAX_DELAY = 8.0
+    MAX_RETRY_DELAY = 10.0
+
+    # MusicBrainz requests should be approximately
+    # one request per second.
+    REQUEST_INTERVAL = 1.05
+
+    # ======================================================
+    # Initialization
+    # ======================================================
 
     def __init__(self) -> None:
         self.base_url = (
@@ -52,7 +88,9 @@ class MusicBrainzService:
         )
 
         self.headers = {
-            "User-Agent": settings.musicbrainz_user_agent,
+            "User-Agent": (
+                settings.musicbrainz_user_agent
+            ),
             "Accept": "application/json",
         }
 
@@ -63,118 +101,98 @@ class MusicBrainzService:
             pool=5.0,
         )
 
-    # ==========================================
-    # Retry helpers
-    # ==========================================
+        # --------------------------------------------------
+        # Rate-limit lock
+        #
+        # Prevents concurrent requests from this service
+        # from hitting MusicBrainz simultaneously.
+        # --------------------------------------------------
 
-    @staticmethod
-    def _retry_after_seconds(
-        response: httpx.Response,
-    ) -> float | None:
+        self._request_lock = asyncio.Lock()
+
+        self._last_request_at = 0.0
+
+    # ======================================================
+    # Rate-limit handling
+    # ======================================================
+
+    async def _wait_for_rate_limit(self) -> None:
         """
-        Read Retry-After from a MusicBrainz response.
+        Ensure requests are separated by approximately
+        one second.
 
-        Supports the standard integer-seconds form.
-
-        Example:
-            Retry-After: 2
+        The lock is important because asyncio.gather()
+        could otherwise allow multiple requests to pass
+        the time check simultaneously.
         """
-        value = response.headers.get(
-            "Retry-After"
-        )
 
-        if not value:
-            return None
+        loop = asyncio.get_running_loop()
 
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
-            return None
+        async with self._request_lock:
+            now = loop.time()
 
-        if seconds < 0:
-            return None
+            elapsed = (
+                now - self._last_request_at
+            )
 
-        return min(
-            seconds,
-            MusicBrainzService.RETRY_MAX_DELAY,
-        )
+            if elapsed < self.REQUEST_INTERVAL:
+                await asyncio.sleep(
+                    self.REQUEST_INTERVAL
+                    - elapsed
+                )
 
-    @classmethod
-    def _backoff_seconds(
-        cls,
+            self._last_request_at = (
+                loop.time()
+            )
+
+    # ======================================================
+    # Retry delay
+    # ======================================================
+
+    def _retry_delay(
+        self,
         attempt: int,
     ) -> float:
         """
-        Calculate exponential backoff with small jitter.
-
-        attempt=0 -> around 1 second
-        attempt=1 -> around 2 seconds
-        attempt=2 -> around 4 seconds
+        Exponential backoff with small random jitter.
         """
-        delay = min(
-            cls.RETRY_BASE_DELAY * (2**attempt),
-            cls.RETRY_MAX_DELAY,
+
+        exponential_delay = min(
+            self.BASE_RETRY_DELAY
+            * (2**attempt),
+            self.MAX_RETRY_DELAY,
         )
 
-        # Small jitter prevents synchronized retries.
         jitter = random.uniform(
             0.0,
-            0.25,
+            0.5,
         )
 
-        return min(
-            delay + jitter,
-            cls.RETRY_MAX_DELAY,
+        return (
+            exponential_delay
+            + jitter
         )
 
-    @classmethod
-    async def _sleep_before_retry(
-        cls,
-        *,
-        attempt: int,
-        response: httpx.Response | None = None,
-    ) -> None:
-        """
-        Wait before retrying.
-
-        Prefer MusicBrainz's Retry-After header when available.
-        Otherwise use exponential backoff.
-        """
-        retry_after = None
-
-        if response is not None:
-            retry_after = cls._retry_after_seconds(
-                response
-            )
-
-        delay = (
-            retry_after
-            if retry_after is not None
-            else cls._backoff_seconds(attempt)
-        )
-
-        await asyncio.sleep(delay)
-
-    # ==========================================
+    # ======================================================
     # HTTP GET
-    # ==========================================
+    # ======================================================
 
     async def _get(
         self,
         endpoint: str,
-        params: dict[str, Any],
+        params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
-        Perform a GET request against MusicBrainz.
+        Execute a GET request against MusicBrainz.
 
-        Temporary failures are retried automatically.
+        Retryable:
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
 
-        Retryable HTTP statuses:
-            429
-            500
-            502
-            503
-            504
+        Non-retryable HTTP errors are propagated.
 
         Connection and timeout failures are also retried.
         """
@@ -183,6 +201,8 @@ class MusicBrainzService:
             f"{self.base_url}/"
             f"{endpoint.lstrip('/')}"
         )
+
+        request_params = params or {}
 
         async with httpx.AsyncClient(
             headers=self.headers,
@@ -193,42 +213,73 @@ class MusicBrainzService:
             for attempt in range(
                 self.MAX_RETRIES + 1
             ):
-                response: httpx.Response | None = None
-
                 try:
-                    response = await client.get(
-                        url,
-                        params=params,
+                    await self._wait_for_rate_limit()
+
+                    response = (
+                        await client.get(
+                            url,
+                            params=request_params,
+                        )
                     )
 
-                    # ------------------------------------------
+                    # --------------------------------------
                     # Success
-                    # ------------------------------------------
+                    # --------------------------------------
 
                     if response.is_success:
                         return response.json()
 
-                    # ------------------------------------------
-                    # Retryable HTTP failure
-                    # ------------------------------------------
+                    # --------------------------------------
+                    # Retryable HTTP error
+                    # --------------------------------------
 
                     if (
                         response.status_code
                         in self.RETRYABLE_STATUS_CODES
                     ):
-                        if attempt < self.MAX_RETRIES:
-                            await self._sleep_before_retry(
-                                attempt=attempt,
-                                response=response,
+                        if (
+                            attempt
+                            >= self.MAX_RETRIES
+                        ):
+                            response.raise_for_status()
+
+                        retry_after = (
+                            response.headers.get(
+                                "Retry-After"
                             )
-                            continue
+                        )
 
-                        # Retries exhausted.
-                        response.raise_for_status()
+                        if retry_after:
+                            try:
+                                delay = float(
+                                    retry_after
+                                )
+                            except (
+                                ValueError,
+                                TypeError,
+                            ):
+                                delay = (
+                                    self._retry_delay(
+                                        attempt
+                                    )
+                                )
+                        else:
+                            delay = (
+                                self._retry_delay(
+                                    attempt
+                                )
+                            )
 
-                    # ------------------------------------------
-                    # Non-retryable HTTP failure
-                    # ------------------------------------------
+                        await asyncio.sleep(
+                            delay
+                        )
+
+                        continue
+
+                    # --------------------------------------
+                    # Non-retryable HTTP error
+                    # --------------------------------------
 
                     response.raise_for_status()
 
@@ -239,25 +290,34 @@ class MusicBrainzService:
                     httpx.WriteTimeout,
                     httpx.PoolTimeout,
                 ):
-                    # ------------------------------------------
-                    # Temporary connection/timeout failure
-                    # ------------------------------------------
+                    if (
+                        attempt
+                        >= self.MAX_RETRIES
+                    ):
+                        raise
 
-                    if attempt < self.MAX_RETRIES:
-                        await self._sleep_before_retry(
-                            attempt=attempt,
+                    delay = (
+                        self._retry_delay(
+                            attempt
                         )
-                        continue
+                    )
 
+                    await asyncio.sleep(
+                        delay
+                    )
+
+                except httpx.HTTPStatusError:
+                    # Non-retryable HTTP errors should
+                    # propagate immediately.
                     raise
 
         raise RuntimeError(
             "MusicBrainz request failed unexpectedly."
         )
 
-    # ==========================================
+    # ======================================================
     # Artist Search
-    # ==========================================
+    # ======================================================
 
     async def search_artists(
         self,
@@ -286,11 +346,16 @@ class MusicBrainzService:
             "artists",
             [],
         ):
-            artist_mbid = item.get("id")
+            artist_mbid = item.get(
+                "id"
+            )
+
+            if not artist_mbid:
+                continue
 
             artists.append(
                 MusicArtistResult(
-                    mbid=artist_mbid or "",
+                    mbid=artist_mbid,
                     name=item.get(
                         "name",
                         "",
@@ -318,9 +383,283 @@ class MusicBrainzService:
             ),
         )
 
-    # ==========================================
+    # ======================================================
+    # Artist Lookup
+    # ======================================================
+
+    async def get_artist(
+        self,
+        musicbrainz_id: str,
+    ) -> MusicArtistResult:
+        """
+        Get a single artist by MusicBrainz MBID.
+        """
+
+        musicbrainz_id = (
+            musicbrainz_id.strip()
+        )
+
+        if not musicbrainz_id:
+            raise ValueError(
+                "MusicBrainz artist MBID "
+                "is required."
+            )
+
+        data = await self._get(
+            f"/artist/{musicbrainz_id}",
+            {
+                "fmt": "json",
+            },
+        )
+
+        artist_mbid = data.get(
+            "id"
+        )
+
+        if not artist_mbid:
+            raise ValueError(
+                "MusicBrainz artist does "
+                "not have an MBID."
+            )
+
+        name = data.get(
+            "name"
+        )
+
+        if not name:
+            raise ValueError(
+                "MusicBrainz artist does "
+                "not have a name."
+            )
+
+        return MusicArtistResult(
+            mbid=artist_mbid,
+            name=name,
+            sort_name=data.get(
+                "sort-name"
+            ),
+            country=data.get(
+                "country"
+            ),
+            type=data.get(
+                "type"
+            ),
+            disambiguation=data.get(
+                "disambiguation"
+            ),
+        )
+
+    # ======================================================
+    # Language-based Artist Discovery
+    # ======================================================
+
+    async def search_artists_by_language(
+        self,
+        language_code: str,
+        max_artists: int = 100,
+    ) -> list[MusicArtistResult]:
+        """
+        Discover artists from MusicBrainz releases
+        matching a specific language.
+
+        Input:
+            hi
+            te
+            ta
+
+        MusicBrainz query:
+            lang:hin
+            lang:tel
+            lang:tam
+
+        Artists are deduplicated using their
+        MusicBrainz artist MBID.
+        """
+
+        language_code = (
+            language_code.strip().lower()
+        )
+
+        if not language_code:
+            return []
+
+        language_639_3 = (
+            self.LANGUAGE_639_1_TO_639_3.get(
+                language_code,
+                language_code,
+            )
+        )
+
+        if not language_639_3:
+            return []
+
+        max_artists = max(
+            1,
+            min(
+                max_artists,
+                100,
+            ),
+        )
+
+        artists_by_mbid: dict[
+            str,
+            MusicArtistResult,
+        ] = {}
+
+        release_offset = 0
+
+        release_page_size = 100
+
+        # --------------------------------------------------
+        # Do not scan MusicBrainz indefinitely.
+        # --------------------------------------------------
+
+        max_release_offset = 500
+
+        query = (
+            f"lang:{language_639_3}"
+        )
+
+        while (
+            len(artists_by_mbid)
+            < max_artists
+            and release_offset
+            < max_release_offset
+        ):
+            data = await self._get(
+                "/release",
+                {
+                    "query": query,
+                    "fmt": "json",
+                    "limit": release_page_size,
+                    "offset": release_offset,
+                },
+            )
+
+            releases = data.get(
+                "releases",
+                [],
+            )
+
+            if not releases:
+                break
+
+            for release in releases:
+                artist_credit = (
+                    release.get(
+                        "artist-credit"
+                    )
+                    or []
+                )
+
+                for credit in artist_credit:
+                    artist = (
+                        credit.get(
+                            "artist"
+                        )
+                        or {}
+                    )
+
+                    artist_mbid = (
+                        artist.get(
+                            "id"
+                        )
+                    )
+
+                    if not artist_mbid:
+                        continue
+
+                    # ----------------------------------
+                    # Duplicate prevention
+                    # ----------------------------------
+
+                    if (
+                        artist_mbid
+                        in artists_by_mbid
+                    ):
+                        continue
+
+                    name = artist.get(
+                        "name"
+                    )
+
+                    if not name:
+                        continue
+
+                    artists_by_mbid[
+                        artist_mbid
+                    ] = MusicArtistResult(
+                        mbid=artist_mbid,
+                        name=name,
+                        sort_name=artist.get(
+                            "sort-name"
+                        ),
+                        country=artist.get(
+                            "country"
+                        ),
+                        type=artist.get(
+                            "type"
+                        ),
+                        disambiguation=(
+                            artist.get(
+                                "disambiguation"
+                            )
+                        ),
+                    )
+
+                    if (
+                        len(
+                            artists_by_mbid
+                        )
+                        >= max_artists
+                    ):
+                        break
+
+                if (
+                    len(
+                        artists_by_mbid
+                    )
+                    >= max_artists
+                ):
+                    break
+
+            # ------------------------------------------
+            # Advance by actual number of results.
+            # ------------------------------------------
+
+            release_offset += len(
+                releases
+            )
+
+            total = data.get(
+                "count",
+                0,
+            )
+
+            if release_offset >= total:
+                break
+
+        artists = list(
+            artists_by_mbid.values()
+        )
+
+        # Stable ordering is important because
+        # these results are cached in PostgreSQL.
+        artists.sort(
+            key=lambda artist: (
+                (
+                    artist.sort_name
+                    or artist.name
+                ).lower(),
+                artist.mbid,
+            )
+        )
+
+        return artists
+
+    # ======================================================
     # Album / Release Search
-    # ==========================================
+    # ======================================================
 
     async def search_albums(
         self,
@@ -349,18 +688,24 @@ class MusicBrainzService:
             "releases",
             [],
         ):
-            release_mbid = item.get("id")
+            release_mbid = item.get(
+                "id"
+            )
 
             artist_name = None
             artist_mbid = None
 
             artist_credit = (
-                item.get("artist-credit")
+                item.get(
+                    "artist-credit"
+                )
                 or []
             )
 
             if artist_credit:
-                first_artist = artist_credit[0]
+                first_artist = (
+                    artist_credit[0]
+                )
 
                 artist = (
                     first_artist.get(
@@ -378,12 +723,16 @@ class MusicBrainzService:
                 )
 
             release_group = (
-                item.get("release-group")
+                item.get(
+                    "release-group"
+                )
                 or {}
             )
 
             release_group_mbid = (
-                release_group.get("id")
+                release_group.get(
+                    "id"
+                )
             )
 
             release_group_type = (
@@ -407,7 +756,10 @@ class MusicBrainzService:
                 MusicAlbumResult(
                     # This is the MusicBrainz
                     # RELEASE MBID.
-                    mbid=release_mbid or "",
+                    mbid=(
+                        release_mbid
+                        or ""
+                    ),
                     title=item.get(
                         "title",
                         "",
@@ -443,9 +795,9 @@ class MusicBrainzService:
             ),
         )
 
-    # ==========================================
+    # ======================================================
     # Track / Recording Search
-    # ==========================================
+    # ======================================================
 
     async def search_tracks(
         self,
@@ -463,7 +815,9 @@ class MusicBrainzService:
                 "fmt": "json",
                 "limit": limit,
                 "offset": offset,
-                "inc": "artists+releases",
+                "inc": (
+                    "artists+releases"
+                ),
             },
         )
 
@@ -476,12 +830,11 @@ class MusicBrainzService:
             [],
         ):
             # ==========================================
-            # IMPORTANT
-            # ==========================================
+            # IMPORTANT:
             #
             # item["id"] is the RECORDING MBID.
             #
-            # This is the ID that must be sent to:
+            # This is the ID sent to:
             #
             # POST /api/v1/downloads
             #
@@ -503,12 +856,16 @@ class MusicBrainzService:
             artist_mbid = None
 
             artist_credit = (
-                item.get("artist-credit")
+                item.get(
+                    "artist-credit"
+                )
                 or []
             )
 
             if artist_credit:
-                first_artist = artist_credit[0]
+                first_artist = (
+                    artist_credit[0]
+                )
 
                 artist = (
                     first_artist.get(
@@ -537,14 +894,18 @@ class MusicBrainzService:
             cover_art_url = None
 
             releases = (
-                item.get("releases")
+                item.get(
+                    "releases"
+                )
                 or []
             )
 
             if releases:
                 # MusicBrainz can return multiple
                 # releases.
-
+                #
+                # We currently use the first release
+                # returned by MusicBrainz.
                 release = releases[0]
 
                 release_mbid = release.get(
@@ -572,10 +933,12 @@ class MusicBrainzService:
                     )
                 )
 
+                # IMPORTANT:
+                #
                 # album_mbid represents the actual
                 # RELEASE associated with this result.
                 #
-                # release_mbid == release.id
+                # album_mbid == release_mbid
                 album_mbid = release_mbid
 
                 if release_mbid:
@@ -598,7 +961,7 @@ class MusicBrainzService:
                     #
                     # This MUST be recording.id
                     #
-                    # This is what the download API expects.
+                    # It is the MusicBrainz RECORDING MBID.
                     # ======================================
                     mbid=recording_mbid,
 
@@ -612,13 +975,13 @@ class MusicBrainzService:
 
                     album_name=album_name,
 
-                    # Release MBID.
+                    # Release MBID
                     album_mbid=album_mbid,
 
-                    # Same release MBID.
+                    # Same release MBID
                     release_mbid=release_mbid,
 
-                    # Release-group MBID.
+                    # Release-group MBID
                     release_group_mbid=(
                         release_group_mbid
                     ),
@@ -649,9 +1012,9 @@ class MusicBrainzService:
             ),
         )
 
-    # ==========================================
+    # ======================================================
     # Combined Search
-    # ==========================================
+    # ======================================================
 
     async def search(
         self,
@@ -659,6 +1022,16 @@ class MusicBrainzService:
         limit: int = 20,
         offset: int = 0,
     ) -> MusicSearchResponse:
+        """
+        Search artists, albums and tracks.
+
+        Requests are intentionally sequential.
+
+        Do NOT change this to asyncio.gather()
+        because MusicBrainz rate limiting is handled
+        centrally by _wait_for_rate_limit().
+        """
+
         artists, artist_count = (
             await self.search_artists(
                 query=query,
@@ -697,5 +1070,9 @@ class MusicBrainzService:
             tracks=tracks,
         )
 
+
+# ==========================================================
+# Singleton
+# ==========================================================
 
 musicbrainz_service = MusicBrainzService()

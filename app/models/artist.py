@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import DateTime, String, Text, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import ARRAY, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -34,6 +34,13 @@ class Artist(Base):
         nullable=True,
     )
 
+    language_codes: Mapped[list[str]] = mapped_column(
+        ARRAY(String(20)),
+        nullable=False,
+        default=list,
+        server_default="{}",
+    )
+
     image_url: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
@@ -58,4 +65,10 @@ class Artist(Base):
     tracks = relationship(
         "Track",
         back_populates="artist",
+    )
+
+    user_preferences = relationship(
+        "UserArtistPreference",
+        back_populates="artist",
+        cascade="all, delete-orphan",
     )
