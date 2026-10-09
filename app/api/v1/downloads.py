@@ -2246,15 +2246,21 @@ async def process_download(
             # In particular, YouTube uploader/channel is NOT
             # treated as the artist when MusicBrainz already
             # provides an artist.
+
             youtube_metadata = (
-                download_result.get("metadata")
-                or {}
+                download_result.get("metadata") or {}
             )
 
-            metadata = resolve_metadata(
+            resolved_metadata = resolve_metadata(
                 musicbrainz=metadata,
                 youtube=youtube_metadata,
             )
+
+            # Convert ResolvedMetadata to a dictionary because the
+            # remaining download pipeline uses metadata.get(...) and
+            # metadata["title"].
+            metadata = resolved_metadata.as_dict()
+
 
             logger.info(
                 "[DOWNLOAD] Resolved metadata: "

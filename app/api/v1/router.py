@@ -20,6 +20,7 @@ from app.api.v1 import (
     search,
     streaming,
     tracks,
+    youtube_music,
 )
 
 api_router = APIRouter()
@@ -42,6 +43,7 @@ api_router.include_router(history.router)
 
 # Search + downloads.
 api_router.include_router(search.router)
+api_router.include_router(youtube_music.router)
 
 # IMPORTANT: register specific download sub-routes BEFORE the catch-all
 # downloads router so /downloads/{id}/progress never gets shadowed.

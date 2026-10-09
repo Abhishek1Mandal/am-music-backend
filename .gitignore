@@ -41,3 +41,7 @@ downloads/
 
 # Alembic
 *.db
+# Private browser session cookies (never commit)
+cookies.txt
+youtube-cookies.txt
+cookies*.txt
