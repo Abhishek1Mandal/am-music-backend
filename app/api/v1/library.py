@@ -8,6 +8,8 @@ from app.core.database import get_db
 from app.dependencies.auth import get_current_user
 from app.models.library import LibraryItem
 from app.models.track import Track
+from app.models.artist import Artist
+from app.models.album import Album
 from app.models.user import User
 
 
@@ -36,11 +38,13 @@ async def get_library(
     current_user: User = Depends(get_current_user),
 ):
     query = (
-        select(LibraryItem, Track)
+        select(LibraryItem, Track, Artist, Album)
         .join(
             Track,
             LibraryItem.track_id == Track.id,
         )
+        .outerjoin(Artist, Track.artist_id == Artist.id)
+        .outerjoin(Album, Track.album_id == Album.id)
         .where(
             LibraryItem.user_id == current_user.id,
         )
@@ -57,7 +61,7 @@ async def get_library(
 
     items = []
 
-    for library_item, track in rows:
+    for library_item, track, artist, album in rows:
         items.append(
             {
                 "id": library_item.id,
@@ -68,6 +72,9 @@ async def get_library(
                 "duration_ms": track.duration_ms,
                 "musicbrainz_id": track.musicbrainz_id,
                 "is_available": track.is_available,
+                "artist_name": artist.name if artist else None,
+                "album_name": album.title if album else None,
+                "cover_art_url": album.cover_url if album else None,
             }
         )
 

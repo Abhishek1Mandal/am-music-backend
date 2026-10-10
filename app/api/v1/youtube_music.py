@@ -11,8 +11,8 @@ router = APIRouter(prefix="/youtube-music", tags=["YouTube Music Provider"])
 @router.get("/search", summary="Search YouTube Music metadata")
 async def search_provider(
     q: str = Query(..., min_length=1, max_length=200),
-    filter: str = Query(default="songs", pattern="^(songs|videos|albums|artists|playlists)$"),
-    limit: int = Query(default=20, ge=1, le=50),
+    filter: str = Query(default="songs", pattern="^(songs|videos|albums|artists|playlists|channels)$"),
+    limit: int = Query(default=20, ge=1, le=100),
     _current_user: User = Depends(get_current_user),
 ):
     """Search public YouTube Music metadata; this endpoint does not require cookies."""

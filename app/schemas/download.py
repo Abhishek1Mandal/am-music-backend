@@ -21,3 +21,7 @@ class DownloadResponse(BaseModel):
     created_at: datetime
     completed_at: datetime | None = None
     is_downloaded: bool = False
+    title: str | None = None
+    artist_name: str | None = None
+    album_name: str | None = None
+    cover_art_url: str | None = None

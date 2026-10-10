@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 
-_ALLOWED_FILTERS = {"songs", "videos", "albums", "artists", "playlists"}
+_ALLOWED_FILTERS = {"songs", "videos", "albums", "artists", "playlists", "channels"}
 _CACHE_TTL_SECONDS = 90
 _CACHE: dict[tuple[str, str, int], tuple[float, list[dict[str, Any]]]] = {}
 _CACHE_LOCK = asyncio.Lock()
@@ -99,7 +99,16 @@ def _search_sync(query: str, filter_name: str, limit: int) -> list[dict[str, Any
         raise RuntimeError("YouTube Music metadata support is not installed. Install requirements.txt.") from exc
 
     client = YTMusic()
-    raw_items = client.search(query, filter=filter_name, limit=limit)
+    # ytmusicapi does not expose a stable dedicated channel filter in every
+    # version. Search broadly for channels and keep channel-like results only.
+    provider_filter = None if filter_name == "channels" else filter_name
+    raw_items = client.search(query, filter=provider_filter, limit=min(50, limit * 3) if filter_name == "channels" else limit)
+    if filter_name == "channels":
+        raw_items = [
+            item for item in (raw_items or [])
+            if isinstance(item, dict)
+            and str(item.get("resultType") or item.get("category") or "").casefold() in {"channel", "artist"}
+        ]
     normalized: list[dict[str, Any]] = []
     for item in raw_items or []:
         if isinstance(item, dict):

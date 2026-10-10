@@ -993,6 +993,10 @@ async def build_download_response(
 
 
 
+    artist_name = None
+    album_name = None
+    cover_art_url = None
+
     if track is not None:
 
         is_downloaded = await sync_track_availability(
@@ -1002,6 +1006,21 @@ async def build_download_response(
             track,
 
         )
+
+        artist_result = await db.execute(
+            select(Artist).where(Artist.id == track.artist_id)
+        )
+        artist = artist_result.scalar_one_or_none()
+        artist_name = artist.name if artist else None
+
+        if track.album_id:
+            album_result = await db.execute(
+                select(Album).where(Album.id == track.album_id)
+            )
+            album = album_result.scalar_one_or_none()
+            if album is not None:
+                album_name = album.title
+                cover_art_url = album.cover_url
 
 
 
@@ -2459,19 +2478,28 @@ async def process_download(
 
 
 
-            artwork_url = None
+            artwork_url = (
+                metadata.get("cover_art_url")
+            )
 
             if album and album.musicbrainz_id:
+                try:
+                    artwork_url = artwork_url or cover_art_service.get_front_cover_url(
+                        album.musicbrainz_id,
+                        1200,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[DOWNLOAD] Could not resolve cover artwork for album %s",
+                        album.title,
+                        exc_info=True,
+                    )
 
-                artwork_url = cover_art_service.get_front_cover_url(
-
-                    album.musicbrainz_id,
-
-                    1200,
-
-                )
-
-
+            # Persist the artwork URL so the Library and Downloads UI can
+            # display the same cover after the audio download completes.
+            if album and artwork_url and not album.cover_url:
+                album.cover_url = artwork_url
+                await db.flush()
 
             try:
 
