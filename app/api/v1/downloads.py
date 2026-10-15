@@ -19,6 +19,8 @@ from uuid import UUID
 
 
 
+from fastapi.responses import FileResponse
+
 from fastapi import (
 
     APIRouter,
@@ -3627,6 +3629,38 @@ async def cancel_download(
 
 
 
+
+
+@router.get(
+    "/{download_id}/file",
+    summary="Retrieve completed audio for browser-side saving",
+)
+async def download_file_for_browser(
+    download_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Stream a completed audio file owned by the authenticated user."""
+    result = await db.execute(
+        select(Download).where(
+            Download.id == download_id,
+            Download.user_id == current_user.id,
+        )
+    )
+    download = result.scalar_one_or_none()
+    if download is None:
+        raise HTTPException(status_code=404, detail="Download not found.")
+    if download.status != "completed" or not download.file_path:
+        raise HTTPException(status_code=409, detail="Audio is not completed yet.")
+    path = Path(download.file_path).resolve()
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Audio file is no longer available on the server.")
+    return FileResponse(
+        path=str(path),
+        filename=path.name,
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 @router.get(
