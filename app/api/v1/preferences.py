@@ -10,7 +10,7 @@ from fastapi import (
     Query,
     status,
 )
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -788,7 +788,20 @@ async def discover_artists(
     )
 
     # --------------------------------------------------------
-    # Check cached artists.
+    # Serialize discovery requests for the same language set.
+    # This prevents concurrent requests from both observing an
+    # empty cache and inserting the same MusicBrainz IDs.
+    # --------------------------------------------------------
+
+    discovery_lock_key = "discover-artists:" + ",".join(sorted(language_codes))
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+        {"lock_key": discovery_lock_key},
+    )
+
+    # --------------------------------------------------------
+    # Check cached artists after acquiring the lock.
+    # A previous concurrent request may have populated the cache.
     # --------------------------------------------------------
 
     try:
@@ -921,7 +934,17 @@ async def discover_artists(
                         continue
 
                     # ----------------------------------------
-                    # Check DB.
+                    # Lock this MBID across all discovery batches,
+                    # including batches with overlapping languages.
+                    # ----------------------------------------
+
+                    await db.execute(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:artist_key))"),
+                        {"artist_key": f"artist:{mbid}"},
+                    )
+
+                    # ----------------------------------------
+                    # Check DB after acquiring the lock.
                     # ----------------------------------------
 
                     result = await db.execute(

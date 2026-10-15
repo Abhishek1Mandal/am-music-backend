@@ -35,9 +35,8 @@ Thumbs.db
 # Logs
 *.log
 
-# Music files
-music/
-downloads/
+# Downloaded music and generated files
+/downloads/
 
 # Alembic
 *.db

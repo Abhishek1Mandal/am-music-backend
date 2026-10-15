@@ -1,3 +1,4 @@
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -20,13 +21,13 @@ from app.services.preferences.languages import seed_languages
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # Startup: initialize required language data.
     async with AsyncSessionLocal() as db:
         await seed_languages(db)
 
     yield
 
-    # Shutdown
+    # Shutdown: close database resources.
     await close_database()
 
 
@@ -37,8 +38,20 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+# Lightweight health endpoint for Render keep-alive checks.
+# Does not query PostgreSQL.
+@app.get("/healthz", tags=["Health"], include_in_schema=False)
+async def healthz():
+    return {
+        "status": "ok",
+        "service": "am-music-api",
+    }
+
+
 # Temporary diagnostic output for CORS troubleshooting.
 print("AM Music API CORS origins:", settings.cors_origins_list)
+
 
 # Middleware
 app.add_middleware(RequestIdMiddleware)
@@ -52,6 +65,7 @@ app.add_middleware(
     expose_headers=["X-Request-ID"],
 )
 
+
 # Exception handlers
 app.add_exception_handler(
     RequestValidationError,
@@ -62,6 +76,7 @@ app.add_exception_handler(
     Exception,
     unhandled_exception_handler,
 )
+
 
 # API routes
 app.include_router(

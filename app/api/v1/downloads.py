@@ -9,6 +9,7 @@ import hashlib
 import logging
 
 import os
+import re
 
 from datetime import datetime, timezone
 
@@ -1752,6 +1753,10 @@ async def process_download(
 
     musicbrainz_id: str,
 
+    direct_metadata: dict | None = None,
+
+    direct_video_id: str | None = None,
+
 ) -> None:
 
     """
@@ -1996,133 +2001,53 @@ async def process_download(
 
 
 
-            logger.info(
+            if direct_video_id:
+                # Direct YouTube Music result: no MusicBrainz lookup needed.
+                metadata = {
+                    "title": (direct_metadata or {}).get("title") or "Unknown title",
+                    "artist_name": (direct_metadata or {}).get("artist_name") or "Unknown artist",
+                    "album_name": (direct_metadata or {}).get("album_name"),
+                    "duration_ms": (direct_metadata or {}).get("duration_ms"),
+                    "cover_art_url": (direct_metadata or {}).get("cover_art_url"),
+                    "artist_mbid": None,
+                    "artist_sort_name": None,
+                    "release_mbid": None,
+                    "release_group_mbid": None,
+                    "release_date": None,
+                    "track_number": None,
+                    "disc_number": None,
+                    "album_artist_name": (direct_metadata or {}).get("artist_name"),
+                }
+                source_url = f"https://www.youtube.com/watch?v={direct_video_id}"
+                logger.info("[DOWNLOAD] Using selected YouTube video: %s", direct_video_id)
+            else:
+                logger.info("[DOWNLOAD] Fetching MusicBrainz recording: %s", musicbrainz_id)
+                recording_data = await get_recording(musicbrainz_id)
+                metadata = extract_recording_metadata(recording_data)
 
-                "[DOWNLOAD] Fetching MusicBrainz recording: %s",
-
-                musicbrainz_id,
-
-            )
-
-
-
-            recording_data = await get_recording(
-
-                musicbrainz_id,
-
-            )
-
-
-
-            metadata = extract_recording_metadata(
-
-                recording_data,
-
-            )
-
-
-
-            logger.info(
-
-                "[DOWNLOAD] MusicBrainz metadata: "
-
-                "title=%s artist=%s album=%s duration=%s",
-
-                metadata["title"],
-
-                metadata["artist_name"],
-
-                metadata["album_name"],
-
-                metadata["duration_ms"],
-
-            )
-
-
-
-            artist_name = metadata.get(
-
-                "artist_name",
-
-            )
-
-
-
-            if not artist_name:
-
-                raise MusicBrainzRecordingError(
-
-                    "MusicBrainz recording has no artist.",
-
+                logger.info(
+                    "[DOWNLOAD] MusicBrainz metadata: title=%s artist=%s album=%s duration=%s",
+                    metadata["title"], metadata["artist_name"],
+                    metadata["album_name"], metadata["duration_ms"],
                 )
 
+                if not metadata.get("artist_name"):
+                    raise MusicBrainzRecordingError("MusicBrainz recording has no artist.")
 
+                logger.info("[DOWNLOAD] Searching YouTube automatically...")
+                resolved_source = await resolve_source(
+                    title=metadata["title"],
+                    artist=metadata.get("artist_name"),
+                    album=metadata.get("album_name"),
+                    duration_ms=metadata.get("duration_ms"),
+                )
+                logger.info(
+                    "[DOWNLOAD] YouTube source resolved: title=%s url=%s score=%.2f",
+                    resolved_source.title, resolved_source.url, resolved_source.score,
+                )
+                source_url = resolved_source.url
 
-            # ==================================================
-
-            # Resolve YouTube source
-
-            # ==================================================
-
-
-
-            logger.info(
-
-                "[DOWNLOAD] Searching YouTube automatically..."
-
-            )
-
-
-
-            resolved_source = await resolve_source(
-
-                title=metadata["title"],
-
-                artist=metadata.get(
-
-                    "artist_name",
-
-                ),
-
-                album=metadata.get(
-
-                    "album_name",
-
-                ),
-
-                duration_ms=metadata.get(
-
-                    "duration_ms",
-
-                ),
-
-            )
-
-
-
-            logger.info(
-
-                "[DOWNLOAD] YouTube source resolved: "
-
-                "title=%s url=%s score=%.2f",
-
-                resolved_source.title,
-
-                resolved_source.url,
-
-                resolved_source.score,
-
-            )
-
-
-
-            download.source_url = (
-
-                resolved_source.url
-
-            )
-
-
+            download.source_url = source_url
 
             download.status = "downloading"
 
@@ -2222,7 +2147,7 @@ async def process_download(
 
                 download_audio,
 
-                resolved_source.url,
+                source_url,
 
                 progress_hook,
 
@@ -2270,15 +2195,17 @@ async def process_download(
                 download_result.get("metadata") or {}
             )
 
-            resolved_metadata = resolve_metadata(
-                musicbrainz=metadata,
-                youtube=youtube_metadata,
-            )
-
-            # Convert ResolvedMetadata to a dictionary because the
-            # remaining download pipeline uses metadata.get(...) and
-            # metadata["title"].
-            metadata = resolved_metadata.as_dict()
+            if direct_video_id:
+                metadata["cover_art_url"] = (
+                    metadata.get("cover_art_url")
+                    or youtube_metadata.get("thumbnail")
+                )
+            else:
+                resolved_metadata = resolve_metadata(
+                    musicbrainz=metadata,
+                    youtube=youtube_metadata,
+                )
+                metadata = resolved_metadata.as_dict()
 
 
             logger.info(
@@ -2771,25 +2698,37 @@ async def create_download(
 
 
 
-    musicbrainz_id = payload.musicbrainz_id.strip()
+    direct_video_id = (payload.video_id or "").strip() or None
+    direct_metadata: dict | None = None
 
-
-
-    if not musicbrainz_id:
-
-        raise HTTPException(
-
-            status_code=status.HTTP_400_BAD_REQUEST,
-
-            detail=(
-
-                "MusicBrainz recording MBID "
-
-                "cannot be empty."
-
-            ),
-
-        )
+    if direct_video_id:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", direct_video_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid YouTube video ID.",
+            )
+        if not payload.title or not payload.artist_name:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="A title and artist name are required for a direct YouTube download.",
+            )
+        # A stable synthetic key lets the existing download/track pipeline
+        # identify this YouTube video without inventing a MusicBrainz ID.
+        musicbrainz_id = f"youtube:{direct_video_id}"
+        direct_metadata = {
+            "title": payload.title.strip(),
+            "artist_name": payload.artist_name.strip(),
+            "album_name": payload.album_name.strip() if payload.album_name else None,
+            "duration_ms": payload.duration_ms,
+            "cover_art_url": payload.cover_art_url,
+        }
+    else:
+        musicbrainz_id = (payload.musicbrainz_id or "").strip()
+        if not musicbrainz_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Provide either a MusicBrainz recording ID or a YouTube video ID.",
+            )
 
 
 
@@ -3078,15 +3017,12 @@ async def create_download(
 
 
     background_tasks.add_task(
-
         process_download,
-
         download.id,
-
         current_user.id,
-
         musicbrainz_id,
-
+        direct_metadata,
+        direct_video_id,
     )
 
 

@@ -3,7 +3,16 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 class DownloadCreate(BaseModel):
-    musicbrainz_id: str = Field(..., min_length=1, max_length=100)
+    # Existing catalog downloads use a MusicBrainz recording ID.
+    # Direct YouTube Music downloads can instead provide a video ID
+    # and the selected result's metadata.
+    musicbrainz_id: str | None = Field(default=None, min_length=1, max_length=100)
+    video_id: str | None = Field(default=None, min_length=11, max_length=11)
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    artist_name: str | None = Field(default=None, max_length=300)
+    album_name: str | None = Field(default=None, max_length=300)
+    duration_ms: int | None = Field(default=None, ge=0)
+    cover_art_url: str | None = Field(default=None, max_length=2000)
 
 class DownloadResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
