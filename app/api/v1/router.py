@@ -19,6 +19,7 @@ from app.api.v1 import (
     preferences,
     search,
     streaming,
+    storage_settings,
     tracks,
     youtube_music,
 )
@@ -27,6 +28,7 @@ api_router = APIRouter()
 
 # Health + auth first.
 api_router.include_router(health.router)
+api_router.include_router(storage_settings.router)
 api_router.include_router(auth.router)
 
 # Catalog.
